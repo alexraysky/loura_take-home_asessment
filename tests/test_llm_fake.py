@@ -1192,3 +1192,21 @@ def test_real_feature_requests_stay_other_low(body):
     answer = classify_text("", body)
     assert (answer["category"], answer["priority"]) == ("other", "low")
     assert answer["summary"] == "Customer suggests a new feature."
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        "if " + "error " * 3300,
+        "What happens if " + "locked out " * 1800,
+        "We want to prevent " + "api is down " * 1600,
+    ],
+)
+def test_long_hypothetical_bodies_stay_low_and_classify_in_linear_time(body):
+    # Every impact match here sits behind one hypothetical cue; rescanning the prefix per match
+    # took over a second on a 20,000-character body and blocked the event loop for that long.
+    assert len(body) <= 20_000
+    start = time.monotonic()
+    answer = classify_text("", body)
+    assert time.monotonic() - start < 0.5
+    assert answer["priority"] == "low"

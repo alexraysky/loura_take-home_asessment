@@ -718,10 +718,27 @@ def _reports_incident(sentence: str) -> bool:
 
 
 def _states(pattern: re.Pattern[str], text: str) -> bool:
-    """Whether ``pattern`` matches in ``text`` without a hypothetical cue before it in its clause."""
-    return any(
-        not _HYPOTHETICAL_RE.search(_CLAUSE_SPLIT_RE.split(text[: m.start()])[-1]) for m in pattern.finditer(text)
-    )
+    """Whether ``pattern`` matches in ``text`` without a hypothetical cue before it in its clause.
+
+    One pass over the matches and clause separators, each clause searched for a cue at most once,
+    so a long body is never rescanned per match. Every impact cue starts on a word character after
+    a word boundary and every hypothetical cue ends on one, so a cue precedes a match exactly when
+    the clause's first cue ends at or before the match starts.
+    """
+    separators = _CLAUSE_SPLIT_RE.finditer(text)
+    separator = next(separators, None)
+    clause_start, cue_end = 0, None
+    for m in pattern.finditer(text):
+        while separator is not None and separator.end() <= m.start():
+            clause_start, cue_end = separator.end(), None
+            separator = next(separators, None)
+        if cue_end is None:
+            clause_end = separator.start() if separator is not None else len(text)
+            cue = _HYPOTHETICAL_RE.search(text[clause_start:clause_end])
+            cue_end = clause_start + cue.end() if cue else len(text) + 1
+        if cue_end > m.start():
+            return True
+    return False
 
 
 def _reports_degradation(sentence: str) -> bool:
@@ -778,8 +795,14 @@ def _scoring_sentences(text: str, injected: bool, request_elsewhere: bool = Fals
         start += len(sentence) + 1
 
     def marked(pattern: re.Pattern[str]) -> list[bool]:
+        # Hits and spans are both in text order, so one shared cursor keeps this linear.
         hits = [m.span() for m in pattern.finditer(joined)]
-        return [any(a < end and begin < b for a, b in hits) for begin, end in spans]
+        flags, i = [], 0
+        for begin, end in spans:
+            while i < len(hits) and hits[i][1] <= begin:
+                i += 1
+            flags.append(i < len(hits) and hits[i][0] < end)
+        return flags
 
     kept = [i for i, sentence in enumerate(sentences) if not _SIGN_OFF_RE.fullmatch(sentence)]
     if injected:
