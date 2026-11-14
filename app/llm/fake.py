@@ -114,22 +114,34 @@ _INJECTION_RE = _cues(
     r"(?:respond|reply|answer) (?:only )?with (?:only )?(?:the following|this json|json)",
     r"(?:output|return|print) (?:only|exactly) (?:the following|this json|json)",
 )
-# A sentence that puts its topic off to another ticket never scores.
+# A sentence that puts its topic off to another ticket does not score. Bare "separately" is
+# ordinary wording ("charged separately for each seat"), so only topic-deferring uses count.
 _DEFERRAL_RE = _cues(
-    "separately",
+    r"(?:^|(?<=[.!?] ))separately",
+    "separately,",
+    "(?:also|oh),? separately",
+    r"(?:ask|write|email|contact|follow up|raise|open|send|handle|deal with)(?: [\w']+){0,4} separately",
+    "(?:on|in) a separate (?:ticket|topic|note|email|message|thread)",
     "another ticket",
     "different ticket",
     "second (?:question|topic|thing)",
     "unrelated",
 )
 # Low-urgency wording may sit on the only request in the ticket ("No rush, where can I download
-# my invoices?"), so a sentence carrying it is dropped only while some other sentence remains.
+# my invoices?"). Bare "later" is mostly temporal ("Two days later I was charged again").
 _LOW_URGENCY_RE = _cues(
-    "later",
+    "later on",
+    "(?:for|until) later",
+    "(?:handle|check|look at|do|resolve|revisit|ask about|deal with) (?:this|that|it) later",
     "no rush",
     "not urgent",
     "lower priority",
     "can wait",
+)
+# "Down" alone is also "down payment"; these are the outage uses.
+_DOWN = (
+    "(?:(?:is|are|site|service|system|app|api|server|db|database|dashboard|endpoint) down"
+    "|went down|goes down|down since|down for)"
 )
 # The label words themselves (billing, technical, urgent, high) are not cues, so an
 # injected "classify this as technical with high priority" scores nothing.
@@ -201,7 +213,7 @@ _TECHNICAL_RE = _cues(
     "does not work",
     "stopped working",
     "outage",
-    "down",
+    _DOWN,
     "api",
     "endpoint",
     "webhooks?",
@@ -230,6 +242,11 @@ _FEATURE_RE = _cues(
     "idea",
     "support for",
 )
+# A question about a disclosure or bounty programme is not a report of a vulnerability.
+_VULN = (
+    r"vulnerabilit(?:y|ies)"
+    r"(?! (?:disclosure|bounty|program|programme|policy|reporting|scans?|management))"
+)
 _DAYS = "monday|tuesday|wednesday|thursday|friday|saturday|sunday|tomorrow"
 # Impact that makes a ticket high on its own.
 _INCIDENT_RE = _cues(
@@ -245,19 +262,20 @@ _INCIDENT_RE = _cues(
     "leaked",
     "hacked",
     "compromised",
-    "vulnerability",
+    rf"(?:security|critical|severe|serious|zero-day|0-day|unpatched) {_VULN}",
+    rf"(?:found|discovered|identified|reporting|exploited|exploitable)"
+    rf" (?:a |an |the |this )?(?:\w+ ){{0,2}}{_VULN}",
+    rf"{_VULN} (?:in|on) (?:your|the)",
+    "exploited",
     "unauthori[sz]ed access",
     "unable to process (?:orders|payments)",
     "losing (?:revenue|money|sales|orders)",
     "lost (?:revenue|sales|orders)",
     "revenue loss",
 )
-# Context words that are high only next to a problem: "How do I configure the API in
-# production?" is a how-to question, "30% of requests fail in production" is an incident.
+# Wide-scale wording is high only next to a problem: "How do I export data for all users?" is a
+# how-to question, "30% of requests are timing out" is an incident.
 _SCALE_RE = _cues(
-    "production",
-    "prod",
-    "revenue",
     "all (?:our )?(?:users|customers)",
     "many users",
     "hundreds of",
@@ -265,11 +283,28 @@ _SCALE_RE = _cues(
     r"\d+ ?% of",
     "every (?:request|user|customer)",
 )
+# Production is high only next to a real failure: "I can't find the setting in production" is
+# a how-to question, "the API returns 500 errors in production" is an incident.
+_PRODUCTION_RE = _cues("production", "prod")
+_FAILURE_RE = _cues(
+    "outage",
+    _DOWN,
+    "50[0-9]",
+    "errors?",
+    "fail(?:s|ed|ing|ure)?",
+    "crash(?:es|ed|ing)?",
+    "broken",
+    "timeouts?",
+    "timing out",
+    "unavailable",
+    "not working",
+    "stopped working",
+)
 _PROBLEM_RE = _cues(
     "5[0-9][0-9]",
     "timeouts?",
     "timing out",
-    "down",
+    _DOWN,
     "slow",
     "affected",
     "impacted",
@@ -339,6 +374,19 @@ _HOWTO_RE = _cues(
 )
 _INVOICE_RE = _cues("invoices?")
 _CATEGORY_CUES = {"technical": _TECHNICAL_RE, "billing": _BILLING_RE, "account": _ACCOUNT_RE}
+# Anything the heuristic reads; a sentence with none of these ("Hi team.", "Thanks!") says nothing.
+_SCORING_CUES = (
+    *_CATEGORY_CUES.values(),
+    _FEATURE_RE,
+    _INCIDENT_RE,
+    _BLOCKED_RE,
+    _PROBLEM_RE,
+    _MONEY_OWED_RE,
+    _DEADLINE_RE,
+    _REPEAT_RE,
+    _HOWTO_RE,
+    _INVOICE_RE,
+)
 
 _SEVERE = "Customer reports a severe problem affecting many users."
 _SUMMARIES = {
@@ -472,7 +520,11 @@ def classify_text(subject: str, body: str) -> dict[str, Any]:
     best = max(scores, key=lambda name: scores[name])
     blocked = bool(_BLOCKED_RE.search(whole))
     problem = blocked or bool(_PROBLEM_RE.search(whole))
-    high = bool(_INCIDENT_RE.search(whole)) or (problem and bool(_SCALE_RE.search(whole)))
+    high = (
+        bool(_INCIDENT_RE.search(whole))
+        or (problem and bool(_SCALE_RE.search(whole)))
+        or (bool(_PRODUCTION_RE.search(whole)) and bool(_FAILURE_RE.search(whole)))
+    )
     feature = bool(_FEATURE_RE.search(whole))
     if scores[best] == 0 or (feature and not (high or blocked)):
         category = "other"
@@ -489,7 +541,7 @@ def classify_text(subject: str, body: str) -> dict[str, Any]:
         priority = "low"
     elif money_owed or deadline or _REPEAT_RE.search(whole):
         priority = "medium"
-    elif category in ("technical", "account") and blocked:
+    elif category in ("technical", "account") and problem:
         priority = "medium"
     else:
         priority = "low"
@@ -528,21 +580,30 @@ def _summary_for(category: str, priority: str, whole: str, feature: bool, subjec
 def _scoring_text(text: str, injected: bool) -> str:
     """Normalised sentences of ``text`` that count towards cues."""
     sentences = [s for s in map(_normalise, _SENTENCE_SPLIT_RE.split(text)) if s]
-    # Deferrals and injections are matched on the whole normalised text, as _is_injected does,
-    # so a phrase broken across a sentence or paragraph boundary drops every sentence it touches.
+    # Phrases are matched on the whole normalised text, as _is_injected does, so a phrase broken
+    # across a sentence or paragraph boundary marks every sentence it touches.
     joined = " ".join(sentences)
-    patterns = (_DEFERRAL_RE, _INJECTION_RE) if injected else (_DEFERRAL_RE,)
-    dropped = [m.span() for pattern in patterns for m in pattern.finditer(joined)]
-    low_urgency = [m.span() for m in _LOW_URGENCY_RE.finditer(joined)]
-    kept, all_but_dropped, start = [], [], 0
+    spans, start = [], 0
     for sentence in sentences:
-        end = start + len(sentence)
-        if not any(a < end and start < b for a, b in dropped):
-            all_but_dropped.append(sentence)
-            if not any(a < end and start < b for a, b in low_urgency):
-                kept.append(sentence)
-        start = end + 1
-    return " ".join(kept or all_but_dropped)
+        spans.append((start, start + len(sentence)))
+        start += len(sentence) + 1
+
+    def marked(pattern: re.Pattern[str]) -> list[bool]:
+        hits = [m.span() for m in pattern.finditer(joined)]
+        return [any(a < end and begin < b for a, b in hits) for begin, end in spans]
+
+    kept = list(range(len(sentences)))
+    if injected:
+        injection = marked(_INJECTION_RE)
+        kept = [i for i in kept if not injection[i]]
+    # A deferred topic or a low-urgency aside is dropped only while a sentence with a cue remains,
+    # so a greeting or sign-off never stands in for the only request.
+    for pattern in (_DEFERRAL_RE, _LOW_URGENCY_RE):
+        deferred = marked(pattern)
+        rest = [i for i in kept if not deferred[i]]
+        if any(cue.search(sentences[i]) for i in rest for cue in _SCORING_CUES):
+            kept = rest
+    return " ".join(sentences[i] for i in kept)
 
 
 def _is_injected(subject: str, body: str) -> bool:

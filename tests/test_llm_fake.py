@@ -707,6 +707,64 @@ def test_low_urgency_wording_keeps_the_only_request(body, category):
 @pytest.mark.parametrize(
     "body",
     [
+        "Hi team. No rush, where can I download my invoices?",
+        "No rush, where can I download my invoices? Thanks!",
+        "Hi team. No rush, where can I download my invoices? Thanks!",
+        "Where can I download invoices? No rush. Thanks!",
+        "Hello. Where can I download my invoices? I can check this later. Cheers!",
+    ],
+)
+def test_greetings_and_sign_offs_do_not_replace_a_low_urgency_request(body):
+    answer = classify_text("", body)
+    assert (answer["category"], answer["priority"]) == ("billing", "low")
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        "I was charged on May 1. Two days later I was charged again.",
+        "I was charged on May 1 and a week later the same charge appeared again.",
+    ],
+)
+def test_temporal_later_is_not_a_deferral(body):
+    answer = classify_text("", body)
+    assert (answer["category"], answer["priority"]) == ("billing", "medium")
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        "I was charged separately for each seat and that is wrong, overcharged.",
+        "We were billed separately for each seat. That is wrong, we were overcharged.",
+    ],
+)
+def test_ordinary_separately_keeps_the_request(body):
+    answer = classify_text("", body)
+    assert (answer["category"], answer["priority"]) == ("billing", "medium")
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        "Export crashes with 500 error. Separately, please refund last month.",
+        "Export crashes with 500 error. Also separately, I want a refund for last month.",
+        "Export crashes with 500 error. I will open a ticket about my refund separately.",
+        "Export crashes with 500 error. On a separate topic, please refund last month.",
+    ],
+)
+def test_topic_deferring_separately_does_not_score(body):
+    answer = classify_text("", body)
+    assert (answer["category"], answer["priority"]) == ("technical", "medium")
+
+
+def test_a_deferral_on_the_only_request_still_scores():
+    answer = classify_text("", "Hi. Separately, where can I download my invoices?")
+    assert (answer["category"], answer["priority"]) == ("billing", "low")
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
         "Export keeps failing with 500. Not urgent, where can I find my invoice?",
         "The CSV export fails with an error every time. Separately, later please refund my invoice.",
         "The CSV export fails with an error every time. Also, no rush on our invoice question.",
@@ -724,12 +782,42 @@ def test_low_urgency_secondary_topic_does_not_score(body):
         ("Where can I download your security whitepaper?", "other"),
         ("How do I configure 2FA security?", "account"),
         ("How do I export a revenue report?", "technical"),
+        ("Is there a vulnerability disclosure program?", "other"),
+        ("Do you run a vulnerability bounty programme?", "other"),
+        ("Can I set up a down payment plan?", "billing"),
     ],
 )
 def test_context_words_alone_do_not_raise_priority(body, category):
     answer = classify_text("Question", body)
     assert (answer["category"], answer["priority"]) == (category, "low")
     assert "production problem" not in answer["summary"]
+
+
+@pytest.mark.parametrize(
+    ("body", "category", "priority"),
+    [
+        ("How do I set up SSO? I can't find the setting in production.", "account", "medium"),
+        ("We can't find the export button in prod.", "technical", "medium"),
+        ("Our revenue dashboard is slow to load", "technical", "medium"),
+        ("The revenue report export is slow.", "technical", "medium"),
+    ],
+)
+def test_production_and_revenue_without_an_outage_are_not_high(body, category, priority):
+    answer = classify_text("Question", body)
+    assert (answer["category"], answer["priority"]) == (category, priority)
+
+
+@pytest.mark.parametrize("body", ["I need a down payment plan.", "How does the down payment work?"])
+def test_down_payment_is_billing(body):
+    assert classify_text("", body)["category"] == "billing"
+
+
+@pytest.mark.parametrize(
+    "body",
+    ["Our API is down since this morning.", "The dashboard went down an hour ago.", "The server is down."],
+)
+def test_outage_uses_of_down_are_technical(body):
+    assert classify_text("", body)["category"] == "technical"
 
 
 @pytest.mark.parametrize(
@@ -741,6 +829,14 @@ def test_context_words_alone_do_not_raise_priority(body, category):
         "Someone has unauthorized access to our admin account.",
         "We are unable to process payments and are losing revenue.",
         "We have a data leak.",
+        "We found a security vulnerability in your login page.",
+        "I found a vulnerability in your API that exposes other workspaces.",
+        "There is a critical vulnerability in the file upload.",
+        "A zero-day vulnerability in your SDK is being exploited.",
+        "Our account was exploited through your password reset flow.",
+        "The export in production fails with a timeout.",
+        "Production checkout is broken and we are losing revenue.",
+        "About 30% of requests to the API return 500 errors in production.",
     ],
 )
 def test_described_impact_raises_priority(body):
