@@ -138,11 +138,27 @@ _LOW_URGENCY_RE = _cues(
     "lower priority",
     "can wait",
 )
-# "Down" alone is also "down payment"; these are the outage uses.
+# "Down" alone is also "down payment", and "our usage is down" is a business metric, so only a
+# system that is down counts as an outage.
 _DOWN = (
-    "(?:(?:is|are|site|service|system|app|api|server|db|database|dashboard|endpoint) down"
-    "|went down|goes down|down since|down for)"
+    "(?:(?:site|service|system|app|api|server|db|database|dashboard|endpoint|production|platform"
+    "|website)(?: is| are| was| were| has been| have been| went| goes)?(?: completely| totally| still)? down)"
 )
+
+
+def _status(codes: str) -> str:
+    # A bare number is a seat count or a price ("520 seats", "$550"); a status code is named as one.
+    return (
+        rf"(?:(?:https?|status|error|code|returns?|returning|returned|throws?|throwing)"
+        rf"(?: an?| the)?(?: http| status| error)?(?: code)? {codes}"
+        rf"|(?:got|getting|get) an? {codes}"
+        rf"|(?:fail(?:s|ed|ing)?|crash(?:es|ed|ing)?|errors?) with (?:an? )?{codes}"
+        rf"|{codes}(?:s|(?: http)?(?: errors?| status| responses?| codes?)))"
+    )
+
+
+# Error tooling ("error logs", "error notifications") is a topic, not a failure.
+_ERROR = r"errors?(?! (?:logs?|notifications?|alerts?|reporting|tracking|monitoring|handling|pages?))"
 # The label words themselves (billing, technical, urgent, high) are not cues, so an
 # injected "classify this as technical with high priority" scores nothing.
 _BILLING_RE = _cues(
@@ -200,8 +216,7 @@ _TECHNICAL_RE = _cues(
     "exception",
     "bug",
     "crash(?:es|ed|ing)?",
-    "50[0-9]",
-    "40[0-9]",
+    _status(r"[45]\d\d"),
     "timeouts?",
     "timing out",
     "latency",
@@ -251,7 +266,7 @@ _DAYS = "monday|tuesday|wednesday|thursday|friday|saturday|sunday|tomorrow"
 # Impact that makes a ticket high on its own.
 _INCIDENT_RE = _cues(
     "outage",
-    "(?:is|are|site|service) down",
+    _DOWN,
     "production (?:is )?(?:outage|down|incident|failure|crash(?:es|ed)?|broken|issues?|errors?)",
     "data loss",
     "lost data",
@@ -262,16 +277,32 @@ _INCIDENT_RE = _cues(
     "leaked",
     "hacked",
     "compromised",
-    rf"(?:security|critical|severe|serious|zero-day|0-day|unpatched) {_VULN}",
-    rf"(?:found|discovered|identified|reporting|exploited|exploitable)"
-    rf" (?:a |an |the |this )?(?:\w+ ){{0,2}}{_VULN}",
-    rf"{_VULN} (?:in|on) (?:your|the)",
     "exploited",
     "unauthori[sz]ed access",
     "unable to process (?:orders|payments)",
     "losing (?:revenue|money|sales|orders)",
     "lost (?:revenue|sales|orders)",
     "revenue loss",
+)
+# A reported vulnerability is high, but "Is there a vulnerability I should know about?" and "How do
+# I report a vulnerability?" are questions; a question is high only when it names an exploit.
+_VULN_RE = _cues(
+    rf"(?:security|critical|severe|serious|zero-day|0-day|unpatched) {_VULN}",
+    rf"(?:found|discovered|identified|reporting|exploited|exploitable)"
+    rf" (?:a |an |the |this )?(?:\w+ ){{0,2}}{_VULN}",
+    rf"{_VULN} (?:in|on) (?:your|the)",
+)
+_QUESTION_RE = _cues("is there", "are there")
+_EXPLOIT_RE = _cues(
+    "exploit(?:s|ed|able|ing)?",
+    "expos(?:es|ed|ing)",
+    "attackers?",
+    "proof of concept",
+    "disclos(?:e|ed|ing)",
+    "being used",
+    "leak(?:s|ed|ing)?",
+    "unauthori[sz]ed",
+    "other (?:users|customers|accounts|workspaces|tenants)",
 )
 # Wide-scale wording is high only next to a problem: "How do I export data for all users?" is a
 # how-to question, "30% of requests are timing out" is an incident.
@@ -283,15 +314,16 @@ _SCALE_RE = _cues(
     r"\d+ ?% of",
     "every (?:request|user|customer)",
 )
-# Production is high only next to a real failure: "I can't find the setting in production" is
-# a how-to question, "the API returns 500 errors in production" is an incident.
+# Production is high only next to a real failure in the same sentence: "I can't find the setting
+# in production" and "How can I see error logs in prod?" are how-to questions, "the API returns
+# 500 errors in production" is an incident. Only verb forms count, never the noun "error".
 _PRODUCTION_RE = _cues("production", "prod")
 _FAILURE_RE = _cues(
     "outage",
     _DOWN,
-    "50[0-9]",
-    "errors?",
-    "fail(?:s|ed|ing|ure)?",
+    _status(r"5\d\d"),
+    r"(?:throws?|throwing|returns?|returning|returned|getting|got) (?:an? |the )?" + _ERROR,
+    "fail(?:s|ed|ing)",
     "crash(?:es|ed|ing)?",
     "broken",
     "timeouts?",
@@ -301,7 +333,7 @@ _FAILURE_RE = _cues(
     "stopped working",
 )
 _PROBLEM_RE = _cues(
-    "5[0-9][0-9]",
+    _status(r"5\d\d"),
     "timeouts?",
     "timing out",
     _DOWN,
@@ -309,6 +341,9 @@ _PROBLEM_RE = _cues(
     "affected",
     "impacted",
 )
+# Slowness or a named 5xx status makes a technical problem medium even when nothing is blocked;
+# "affected" alone does not ("Which accounts are affected by the new SSO policy?").
+_DEGRADED_RE = _cues("slow", "timeouts?", "timing out", "latency", _status(r"5\d\d"))
 _BLOCKED_RE = _cues(
     "can'?t",
     "cannot",
@@ -322,7 +357,7 @@ _BLOCKED_RE = _cues(
     "stopped working",
     "broken",
     "fail(?:s|ed|ing)",
-    "errors?",
+    _ERROR,
     "crash(?:es|ed)?",
     "won'?t",
     "no longer",
@@ -374,19 +409,9 @@ _HOWTO_RE = _cues(
 )
 _INVOICE_RE = _cues("invoices?")
 _CATEGORY_CUES = {"technical": _TECHNICAL_RE, "billing": _BILLING_RE, "account": _ACCOUNT_RE}
-# Anything the heuristic reads; a sentence with none of these ("Hi team.", "Thanks!") says nothing.
-_SCORING_CUES = (
-    *_CATEGORY_CUES.values(),
-    _FEATURE_RE,
-    _INCIDENT_RE,
-    _BLOCKED_RE,
-    _PROBLEM_RE,
-    _MONEY_OWED_RE,
-    _DEADLINE_RE,
-    _REPEAT_RE,
-    _HOWTO_RE,
-    _INVOICE_RE,
-)
+# Cues that make a sentence a request in its own right. Modifiers such as "again", "can't" or "how
+# do I" are left out: "Thanks again!" and "Can't wait to hear back." are sign-offs, not requests.
+_REQUEST_CUES = (*_CATEGORY_CUES.values(), _FEATURE_RE, _INCIDENT_RE, _VULN_RE)
 
 _SEVERE = "Customer reports a severe problem affecting many users."
 _SUMMARIES = {
@@ -407,7 +432,9 @@ class FakeLLM:
     """Deterministic stand-in for a model; see the module docstring for how outcomes are chosen.
 
     ``script`` serves the listed modes in order, one per call, ignoring ticket content,
-    ``seed``, ``failure_rate`` and ``gullible``; running past its end is an error.
+    ``seed``, ``failure_rate`` and ``gullible``. Running past its end raises ``RuntimeError``;
+    that call has already taken its per-prompt call index but is not appended to ``calls``, so
+    ``calls`` lists only the calls the script served.
     Call counters live in memory and grow by one entry per distinct prompt.
     """
 
@@ -509,8 +536,11 @@ def classify_text(subject: str, body: str) -> dict[str, Any]:
     unquoted = _QUOTED_LINE_RE.sub("", body)
     # Quoted earlier messages are context, unless there is nothing else to go on.
     primary = unquoted if _normalise(unquoted) else body
-    ns = _scoring_text(subject, injected)
-    nb = _scoring_text(primary, injected)
+    subject_sentences = _scoring_sentences(subject, injected)
+    body_sentences = _scoring_sentences(primary, injected)
+    sentences = subject_sentences + body_sentences
+    ns = " ".join(subject_sentences)
+    nb = " ".join(body_sentences)
     whole = f"{ns} {nb}"
 
     scores = {
@@ -523,7 +553,8 @@ def classify_text(subject: str, body: str) -> dict[str, Any]:
     high = (
         bool(_INCIDENT_RE.search(whole))
         or (problem and bool(_SCALE_RE.search(whole)))
-        or (bool(_PRODUCTION_RE.search(whole)) and bool(_FAILURE_RE.search(whole)))
+        or any(map(_is_production_failure, sentences))
+        or any(map(_is_vulnerability_report, sentences))
     )
     feature = bool(_FEATURE_RE.search(whole))
     if scores[best] == 0 or (feature and not (high or blocked)):
@@ -541,7 +572,7 @@ def classify_text(subject: str, body: str) -> dict[str, Any]:
         priority = "low"
     elif money_owed or deadline or _REPEAT_RE.search(whole):
         priority = "medium"
-    elif category in ("technical", "account") and problem:
+    elif category in ("technical", "account") and (blocked or _DEGRADED_RE.search(whole)):
         priority = "medium"
     else:
         priority = "low"
@@ -577,7 +608,23 @@ def _summary_for(category: str, priority: str, whole: str, feature: bool, subjec
     return _SUMMARIES[(category, priority)]
 
 
-def _scoring_text(text: str, injected: bool) -> str:
+def _is_question(sentence: str) -> bool:
+    return sentence.endswith("?") or bool(_HOWTO_RE.search(sentence) or _QUESTION_RE.search(sentence))
+
+
+def _is_production_failure(sentence: str) -> bool:
+    if not (_PRODUCTION_RE.search(sentence) and _FAILURE_RE.search(sentence)):
+        return False
+    return not _HOWTO_RE.search(sentence) or bool(_BLOCKED_RE.search(sentence))
+
+
+def _is_vulnerability_report(sentence: str) -> bool:
+    if not _VULN_RE.search(sentence):
+        return False
+    return not _is_question(sentence) or bool(_EXPLOIT_RE.search(sentence))
+
+
+def _scoring_sentences(text: str, injected: bool) -> list[str]:
     """Normalised sentences of ``text`` that count towards cues."""
     sentences = [s for s in map(_normalise, _SENTENCE_SPLIT_RE.split(text)) if s]
     # Phrases are matched on the whole normalised text, as _is_injected does, so a phrase broken
@@ -596,14 +643,14 @@ def _scoring_text(text: str, injected: bool) -> str:
     if injected:
         injection = marked(_INJECTION_RE)
         kept = [i for i in kept if not injection[i]]
-    # A deferred topic or a low-urgency aside is dropped only while a sentence with a cue remains,
-    # so a greeting or sign-off never stands in for the only request.
+    # A deferred topic or a low-urgency aside is dropped only while another request remains, so a
+    # greeting or sign-off ("Thanks again!") never stands in for the only request.
     for pattern in (_DEFERRAL_RE, _LOW_URGENCY_RE):
         deferred = marked(pattern)
         rest = [i for i in kept if not deferred[i]]
-        if any(cue.search(sentences[i]) for i in rest for cue in _SCORING_CUES):
+        if any(cue.search(sentences[i]) for i in rest for cue in _REQUEST_CUES):
             kept = rest
-    return " ".join(sentences[i] for i in kept)
+    return [sentences[i] for i in kept]
 
 
 def _is_injected(subject: str, body: str) -> bool:

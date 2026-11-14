@@ -540,6 +540,8 @@ async def test_script_exhaustion_raises():
     await fake.complete(SYSTEM, "b")
     with pytest.raises(RuntimeError, match="exhausted after 2 calls"):
         await fake.complete(SYSTEM, "c")
+    # The failed call is not recorded.
+    assert [call.user for call in fake.calls] == ["a", "b"]
 
 
 async def test_script_overrides_gullible():
@@ -712,11 +714,19 @@ def test_low_urgency_wording_keeps_the_only_request(body, category):
         "Hi team. No rush, where can I download my invoices? Thanks!",
         "Where can I download invoices? No rush. Thanks!",
         "Hello. Where can I download my invoices? I can check this later. Cheers!",
+        "No rush, where can I download my invoices? Thanks again!",
+        "No rush, where can I download my invoices? Can't wait to hear back.",
+        "Separately, where can I download my invoices? Thanks again for your help.",
     ],
 )
 def test_greetings_and_sign_offs_do_not_replace_a_low_urgency_request(body):
     answer = classify_text("", body)
     assert (answer["category"], answer["priority"]) == ("billing", "low")
+
+
+def test_a_sign_off_with_a_modifier_cue_does_not_replace_the_request():
+    answer = classify_text("", "Not urgent, how do I change my email address? I still love the product.")
+    assert (answer["category"], answer["priority"]) == ("account", "low")
 
 
 @pytest.mark.parametrize(
@@ -785,12 +795,51 @@ def test_low_urgency_secondary_topic_does_not_score(body):
         ("Is there a vulnerability disclosure program?", "other"),
         ("Do you run a vulnerability bounty programme?", "other"),
         ("Can I set up a down payment plan?", "billing"),
+        ("How do I configure error notifications in production?", "technical"),
+        ("How can I see error logs in prod?", "technical"),
+        ("Our usage is down this month, can I downgrade my plan?", "billing"),
+        ("Our sales are down, how do I pause my subscription?", "billing"),
+        ("Is there a vulnerability in the latest release I should know about?", "other"),
+        ("How do I go about reporting a vulnerability?", "other"),
     ],
 )
 def test_context_words_alone_do_not_raise_priority(body, category):
     answer = classify_text("Question", body)
     assert (answer["category"], answer["priority"]) == (category, "low")
     assert "production problem" not in answer["summary"]
+    assert answer["summary"] != "Customer reports a severe problem affecting many users."
+
+
+@pytest.mark.parametrize(
+    ("body", "category"),
+    [
+        ("We have 520 seats. Please send me the API docs.", "technical"),
+        ("Our invoice was $550. Can you send the API docs?", "technical"),
+        ("We have 500 users. How do I export data for all users?", "technical"),
+        ("Which team accounts are affected by the new SSO policy?", "account"),
+        ("Which features are impacted by the new SSO policy?", "account"),
+        ("We have 404 seats. How do I invite a team member?", "account"),
+        ("About 50% of our 500 users would love a dark mode.", "other"),
+    ],
+)
+def test_bare_numbers_and_affected_do_not_raise_priority(body, category):
+    answer = classify_text("", body)
+    assert (answer["category"], answer["priority"]) == (category, "low")
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        "The API returns 503.",
+        "We get a 502 from the webhook.",
+        "Uploads fail with 504.",
+        "The sync endpoint keeps returning HTTP 500.",
+        "We see 500s on the export.",
+    ],
+)
+def test_named_status_codes_are_technical_medium(body):
+    answer = classify_text("", body)
+    assert (answer["category"], answer["priority"]) == ("technical", "medium")
 
 
 @pytest.mark.parametrize(
@@ -800,6 +849,8 @@ def test_context_words_alone_do_not_raise_priority(body, category):
         ("We can't find the export button in prod.", "technical", "medium"),
         ("Our revenue dashboard is slow to load", "technical", "medium"),
         ("The revenue report export is slow.", "technical", "medium"),
+        ("Everything works in production. In staging the export shows an error.", "technical", "medium"),
+        ("Production is fine. The staging export fails every time.", "technical", "medium"),
     ],
 )
 def test_production_and_revenue_without_an_outage_are_not_high(body, category, priority):
@@ -814,10 +865,17 @@ def test_down_payment_is_billing(body):
 
 @pytest.mark.parametrize(
     "body",
-    ["Our API is down since this morning.", "The dashboard went down an hour ago.", "The server is down."],
+    [
+        "Our API is down since this morning.",
+        "The dashboard went down an hour ago.",
+        "The server is down.",
+        "The website is completely down.",
+        "Our platform has been down for an hour.",
+    ],
 )
 def test_outage_uses_of_down_are_technical(body):
-    assert classify_text("", body)["category"] == "technical"
+    answer = classify_text("", body)
+    assert (answer["category"], answer["priority"]) == ("technical", "high")
 
 
 @pytest.mark.parametrize(
@@ -837,6 +895,11 @@ def test_outage_uses_of_down_are_technical(body):
         "The export in production fails with a timeout.",
         "Production checkout is broken and we are losing revenue.",
         "About 30% of requests to the API return 500 errors in production.",
+        "Staging is fine, but production throws an error on every checkout.",
+        "In production the export fails and I can't work out how to fix it.",
+        "Is there a fix yet? We found a vulnerability in your API.",
+        "Is the vulnerability in your API being exploited by attackers?",
+        "How do I report a vulnerability in your API that exposes other workspaces?",
     ],
 )
 def test_described_impact_raises_priority(body):
