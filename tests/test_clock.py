@@ -2,7 +2,7 @@ from datetime import UTC, datetime, timedelta, timezone
 
 import pytest
 
-from app.clock import TIMESTAMP_FORMAT, format_ts, parse_ts, utc_now
+from app.clock import format_ts, parse_ts, utc_now
 
 
 def test_format_uses_microseconds_and_z_suffix():
@@ -60,10 +60,6 @@ def test_utc_now_is_aware_utc():
     now = utc_now()
     assert now.utcoffset() == timedelta(0)
     assert parse_ts(format_ts(now)) == now
-
-
-def test_timestamp_format_is_the_documented_one():
-    assert TIMESTAMP_FORMAT == "%Y-%m-%dT%H:%M:%S.%fZ"
 
 
 def test_fake_clock_advances_without_sleeping(clock):

@@ -2,9 +2,11 @@
 
 import math
 import os
+import re
 from collections.abc import Mapping
 from dataclasses import dataclass
 
+_INT_FIELDS = ("worker_count", "max_attempts", "fake_llm_seed")
 _FLOAT_FIELDS = (
     "llm_timeout_s",
     "lease_timeout_s",
@@ -12,6 +14,11 @@ _FLOAT_FIELDS = (
     "backoff_base_s",
     "fake_llm_failure_rate",
 )
+# Upper bounds keep later arithmetic (lease expiry, backoff, task count) well inside sane ranges.
+MAX_WORKER_COUNT = 100
+MAX_ATTEMPTS = 20
+MAX_SECONDS = 86_400.0
+_INT_RE = re.compile(r"[+-]?[0-9]{1,18}")
 _TRUE = frozenset({"1", "true", "yes", "on"})
 _FALSE = frozenset({"0", "false", "no", "off"})
 
@@ -34,16 +41,22 @@ class Settings:
     fake_llm_gullible: bool = True
 
     def __post_init__(self) -> None:
+        self._check_types()
         for name in _FLOAT_FIELDS:
             value = getattr(self, name)
             if not math.isfinite(value):
                 raise ConfigError(f"{name.upper()} must be a finite number, got {value!r}")
         if not self.db_path.strip():
             raise ConfigError("DB_PATH must not be empty")
-        if self.worker_count < 0:
-            raise ConfigError(f"WORKER_COUNT must be 0 or greater, got {self.worker_count}")
-        if self.max_attempts < 1:
-            raise ConfigError(f"MAX_ATTEMPTS must be at least 1, got {self.max_attempts}")
+        if not 0 <= self.worker_count <= MAX_WORKER_COUNT:
+            raise ConfigError(
+                f"WORKER_COUNT must be between 0 and {MAX_WORKER_COUNT}, got {self.worker_count}"
+            )
+        if not 1 <= self.max_attempts <= MAX_ATTEMPTS:
+            raise ConfigError(f"MAX_ATTEMPTS must be between 1 and {MAX_ATTEMPTS}, got {self.max_attempts}")
+        for name in ("llm_timeout_s", "lease_timeout_s", "poll_interval_s", "backoff_base_s"):
+            if getattr(self, name) > MAX_SECONDS:
+                raise ConfigError(f"{name.upper()} must be at most {MAX_SECONDS:g}, got {getattr(self, name)}")
         if self.llm_timeout_s <= 0:
             raise ConfigError(f"LLM_TIMEOUT_S must be greater than 0, got {self.llm_timeout_s}")
         if self.lease_timeout_s <= self.llm_timeout_s:
@@ -59,6 +72,22 @@ class Settings:
             raise ConfigError(
                 f"FAKE_LLM_FAILURE_RATE must be between 0 and 1, got {self.fake_llm_failure_rate}"
             )
+
+    def _check_types(self) -> None:
+        # Direct construction (tests, later issues) gets the same guarantees as from_env.
+        if not isinstance(self.db_path, str):
+            raise ConfigError(f"DB_PATH must be a string, got {self.db_path!r}")
+        if not isinstance(self.fake_llm_gullible, bool):
+            raise ConfigError(f"FAKE_LLM_GULLIBLE must be a boolean, got {self.fake_llm_gullible!r}")
+        for name in _INT_FIELDS:
+            value = getattr(self, name)
+            if isinstance(value, bool) or not isinstance(value, int):
+                raise ConfigError(f"{name.upper()} must be an integer, got {value!r}")
+        for name in _FLOAT_FIELDS:
+            value = getattr(self, name)
+            if isinstance(value, bool) or not isinstance(value, int | float):
+                raise ConfigError(f"{name.upper()} must be a number, got {value!r}")
+            object.__setattr__(self, name, float(value))
 
     @classmethod
     def from_env(cls, env: Mapping[str, str] | None = None) -> Settings:
@@ -96,10 +125,10 @@ def _int(env: Mapping[str, str], name: str, default: int) -> int:
     raw = _raw(env, name)
     if raw is None:
         return default
-    try:
-        return int(raw)
-    except ValueError:
-        raise ConfigError(f"{name} must be an integer, got {raw!r}") from None
+    # int() alone would also accept "1_000", non-ASCII digits and numbers too long to convert.
+    if not _INT_RE.fullmatch(raw):
+        raise ConfigError(f"{name} must be an integer, got {raw!r}")
+    return int(raw)
 
 
 def _float(env: Mapping[str, str], name: str, default: float) -> float:
@@ -107,6 +136,8 @@ def _float(env: Mapping[str, str], name: str, default: float) -> float:
     if raw is None:
         return default
     try:
+        if "_" in raw:
+            raise ValueError(raw)
         value = float(raw)
     except ValueError:
         raise ConfigError(f"{name} must be a number, got {raw!r}") from None

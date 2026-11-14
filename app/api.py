@@ -35,7 +35,7 @@ class ApiError(Exception):
         self.details = details
 
 
-@router.get("/health", tags=["ops"])
+@router.api_route("/health", methods=["GET", "HEAD"], tags=["ops"])
 async def health() -> dict[str, str]:
     """Readiness probe; not part of the ticket API."""
     return {"status": "ok"}

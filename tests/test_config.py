@@ -2,7 +2,8 @@ import dataclasses
 
 import pytest
 
-from app.config import ConfigError, Settings
+from app.config import MAX_ATTEMPTS, MAX_SECONDS, MAX_WORKER_COUNT, ConfigError, Settings
+from tests.conftest import CONFIG_VARS
 from app.main import create_app
 
 ALL_VARS = {
@@ -17,6 +18,10 @@ ALL_VARS = {
     "FAKE_LLM_FAILURE_RATE": "0",
     "FAKE_LLM_GULLIBLE": "false",
 }
+
+
+def test_all_variables_are_covered():
+    assert set(ALL_VARS) == set(CONFIG_VARS)
 
 
 def test_defaults_match_documented_table():
@@ -110,11 +115,35 @@ def test_lease_must_exceed_llm_timeout(env, fragment):
         ("BACKOFF_BASE_S", "-0.5"),
         ("FAKE_LLM_FAILURE_RATE", "1.5"),
         ("FAKE_LLM_FAILURE_RATE", "-0.1"),
+        ("WORKER_COUNT", str(MAX_WORKER_COUNT + 1)),
+        ("MAX_ATTEMPTS", str(MAX_ATTEMPTS + 1)),
+        ("LLM_TIMEOUT_S", "1e30"),
+        ("LEASE_TIMEOUT_S", str(MAX_SECONDS + 1)),
+        ("POLL_INTERVAL_S", str(MAX_SECONDS + 1)),
+        ("BACKOFF_BASE_S", "1e308"),
     ],
 )
 def test_out_of_bounds_values_name_the_variable(name, raw):
     with pytest.raises(ConfigError, match=name):
         Settings.from_env({name: raw})
+
+
+def test_upper_bounds_are_inclusive():
+    s = Settings.from_env(
+        {
+            "WORKER_COUNT": str(MAX_WORKER_COUNT),
+            "MAX_ATTEMPTS": str(MAX_ATTEMPTS),
+            "LLM_TIMEOUT_S": "10",
+            "LEASE_TIMEOUT_S": str(MAX_SECONDS),
+            "FAKE_LLM_FAILURE_RATE": "1",
+        }
+    )
+    assert (s.worker_count, s.max_attempts, s.lease_timeout_s) == (MAX_WORKER_COUNT, MAX_ATTEMPTS, MAX_SECONDS)
+
+
+@pytest.mark.parametrize("raw", ["+3", "-3", "007"])
+def test_signed_and_padded_integers_are_accepted(raw):
+    assert Settings.from_env({"FAKE_LLM_SEED": raw}).fake_llm_seed == int(raw)
 
 
 @pytest.mark.parametrize(
@@ -123,6 +152,10 @@ def test_out_of_bounds_values_name_the_variable(name, raw):
         ("WORKER_COUNT", "four"),
         ("WORKER_COUNT", "2.5"),
         ("FAKE_LLM_SEED", "0x10"),
+        ("FAKE_LLM_SEED", "1_000"),
+        ("FAKE_LLM_SEED", "٣"),  # ARABIC-INDIC DIGIT THREE
+        ("FAKE_LLM_SEED", "9" * 5000),
+        ("LLM_TIMEOUT_S", "1_0.5"),
         ("LLM_TIMEOUT_S", "ten"),
         ("FAKE_LLM_GULLIBLE", "maybe"),
     ],
@@ -140,11 +173,30 @@ def test_non_finite_floats_are_rejected(name, raw):
         Settings.from_env({name: raw})
 
 
-def test_direct_construction_is_validated_too():
-    with pytest.raises(ConfigError, match="LEASE_TIMEOUT_S"):
-        Settings(lease_timeout_s=float("nan"))
-    with pytest.raises(ConfigError, match="DB_PATH"):
-        Settings(db_path="  ")
+@pytest.mark.parametrize(
+    ("kwargs", "name"),
+    [
+        ({"lease_timeout_s": float("nan")}, "LEASE_TIMEOUT_S"),
+        ({"db_path": "  "}, "DB_PATH"),
+        ({"db_path": None}, "DB_PATH"),
+        ({"worker_count": 2.5}, "WORKER_COUNT"),
+        ({"worker_count": True}, "WORKER_COUNT"),
+        ({"worker_count": "3"}, "WORKER_COUNT"),
+        ({"fake_llm_failure_rate": True}, "FAKE_LLM_FAILURE_RATE"),
+        ({"poll_interval_s": "0.5"}, "POLL_INTERVAL_S"),
+        ({"fake_llm_gullible": "false"}, "FAKE_LLM_GULLIBLE"),
+        ({"fake_llm_gullible": 1}, "FAKE_LLM_GULLIBLE"),
+    ],
+)
+def test_direct_construction_is_validated_too(kwargs, name):
+    with pytest.raises(ConfigError, match=name):
+        Settings(**kwargs)
+
+
+def test_direct_construction_normalises_int_durations_to_float():
+    s = Settings(llm_timeout_s=5, lease_timeout_s=30)
+    assert type(s.llm_timeout_s) is float and s.llm_timeout_s == 5.0
+    assert s == Settings(llm_timeout_s=5.0, lease_timeout_s=30.0)
 
 
 def test_config_error_is_a_value_error():
@@ -158,6 +210,5 @@ def test_settings_are_immutable():
 
 def test_create_app_checks_environment_at_startup(monkeypatch):
     monkeypatch.setenv("LEASE_TIMEOUT_S", "5")
-    monkeypatch.delenv("LLM_TIMEOUT_S", raising=False)
     with pytest.raises(ConfigError, match="LEASE_TIMEOUT_S"):
         create_app()

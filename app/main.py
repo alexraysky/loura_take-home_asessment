@@ -3,11 +3,12 @@
 import logging
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
+from http import HTTPStatus
 from typing import Any
 
 from fastapi import FastAPI, Request
 from fastapi.exceptions import RequestValidationError
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, Response
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from app.api import ApiError, ErrorBody, ErrorEnvelope, router
@@ -17,6 +18,8 @@ from app.config import Settings
 log = logging.getLogger("app")
 
 _HTTP_CODES = {404: "not_found", 405: "method_not_allowed"}
+# Statuses that must not carry a body.
+_NO_BODY = {204, 304}
 
 
 def create_app(settings: Settings | None = None, *, clock: Clock = utc_now) -> FastAPI:
@@ -64,9 +67,18 @@ def install_error_handlers(app: FastAPI) -> None:
         return error_response(422, "validation_error", "Request validation failed.", details)
 
     @app.exception_handler(StarletteHTTPException)
-    async def on_http_error(_: Request, exc: StarletteHTTPException) -> JSONResponse:
+    async def on_http_error(_: Request, exc: StarletteHTTPException) -> Response:
+        if exc.status_code in _NO_BODY:
+            return Response(status_code=exc.status_code, headers=exc.headers)
         code = _HTTP_CODES.get(exc.status_code, "http_error")
-        return error_response(exc.status_code, code, str(exc.detail), headers=exc.headers)
+        if isinstance(exc.detail, str):
+            return error_response(exc.status_code, code, exc.detail, headers=exc.headers)
+        # Structured detail goes to "details"; the message stays a readable string.
+        try:
+            message = HTTPStatus(exc.status_code).phrase
+        except ValueError:
+            message = "HTTP error"
+        return error_response(exc.status_code, code, message, exc.detail, headers=exc.headers)
 
     @app.exception_handler(Exception)
     async def on_unexpected(_: Request, exc: Exception) -> JSONResponse:
@@ -75,6 +87,11 @@ def install_error_handlers(app: FastAPI) -> None:
 
 
 def _configure_logging() -> None:
-    # Only when nothing else (uvicorn's --log-config, pytest) has configured the root logger.
-    if not logging.getLogger().handlers:
-        logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+    # uvicorn configures only its own loggers; give the "app" logger a handler so its INFO lines show.
+    # Skipped when the root logger is already set up (pytest, --log-config) and left alone otherwise.
+    if logging.getLogger().handlers or log.handlers:
+        return
+    handler = logging.StreamHandler()
+    handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s"))
+    log.addHandler(handler)
+    log.setLevel(logging.INFO)

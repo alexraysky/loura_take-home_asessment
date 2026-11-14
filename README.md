@@ -24,7 +24,7 @@ make seed    # load the sample tickets into a running server (arrives with the l
 
 The first `make run` or `make test` creates `.venv` from the committed `uv.lock`.
 
-`GET /health` returns `{"status": "ok"}` once the app has started. It is an operational readiness probe and is not part of the ticket API.
+`GET /health` (or `HEAD /health`) returns `{"status": "ok"}` once the app has started. It is an operational readiness probe and is not part of the ticket API.
 
 ### Without make
 
@@ -53,7 +53,20 @@ FAKE_LLM_FAILURE_RATE=0.2
 FAKE_LLM_GULLIBLE=true    the fake obeys injected instructions on the first attempt
 ```
 
-Unset or blank variables use the default. Booleans accept `1/0`, `true/false`, `yes/no` and `on/off`. The app refuses to start, naming the variable, when a value is malformed, not finite or out of bounds: `WORKER_COUNT >= 0`, `MAX_ATTEMPTS >= 1`, `LLM_TIMEOUT_S > 0`, `LEASE_TIMEOUT_S > LLM_TIMEOUT_S`, `POLL_INTERVAL_S > 0`, `BACKOFF_BASE_S >= 0`, `0 <= FAKE_LLM_FAILURE_RATE <= 1`.
+Unset or blank variables use the default; surrounding whitespace is ignored. Booleans accept `1/0`, `true/false`, `yes/no` and `on/off`, case-insensitive. Integers are plain ASCII digits with an optional sign.
+
+The app refuses to start, naming the variable, when a value is malformed, not finite or out of bounds:
+
+| Variable | Allowed |
+|---|---|
+| `WORKER_COUNT` | 0 to 100 |
+| `MAX_ATTEMPTS` | 1 to 20 |
+| `LLM_TIMEOUT_S` | greater than 0, at most 86400 |
+| `LEASE_TIMEOUT_S` | greater than `LLM_TIMEOUT_S`, at most 86400 |
+| `POLL_INTERVAL_S` | greater than 0, at most 86400 |
+| `BACKOFF_BASE_S` | 0 to 86400 |
+| `FAKE_LLM_FAILURE_RATE` | 0 to 1 |
+| `DB_PATH` | not blank |
 
 ## Layout
 
@@ -78,6 +91,7 @@ data/                                                            (planned)
   sample_tickets.json
   expected_labels.json
 tests/
+.python-version
 pyproject.toml
 uv.lock
 Makefile

@@ -22,6 +22,27 @@ class FakeClock:
         self.now += timedelta(seconds=seconds)
 
 
+CONFIG_VARS = (
+    "DB_PATH",
+    "WORKER_COUNT",
+    "MAX_ATTEMPTS",
+    "LLM_TIMEOUT_S",
+    "LEASE_TIMEOUT_S",
+    "POLL_INTERVAL_S",
+    "BACKOFF_BASE_S",
+    "FAKE_LLM_SEED",
+    "FAKE_LLM_FAILURE_RATE",
+    "FAKE_LLM_GULLIBLE",
+)
+
+
+@pytest.fixture(autouse=True)
+def clean_config_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Keep the developer's shell configuration out of the tests."""
+    for name in CONFIG_VARS:
+        monkeypatch.delenv(name, raising=False)
+
+
 @pytest.fixture
 def clock() -> FakeClock:
     return FakeClock(datetime(2026, 11, 14, 12, 0, 0, tzinfo=UTC))

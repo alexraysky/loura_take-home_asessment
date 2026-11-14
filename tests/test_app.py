@@ -1,5 +1,7 @@
 import pytest
-from fastapi import FastAPI
+import logging
+
+from fastapi import FastAPI, HTTPException
 from fastapi.testclient import TestClient
 from pydantic import BaseModel, Field
 
@@ -29,6 +31,14 @@ def probe_app(app: FastAPI) -> FastAPI:
     @app.post("/_items")
     async def create_item(item: Item):
         return item
+
+    @app.get("/_not_modified")
+    async def not_modified():
+        raise HTTPException(304, headers={"etag": '"v1"'})
+
+    @app.get("/_structured")
+    async def structured():
+        raise HTTPException(400, detail={"field": "x"})
 
     @app.get("/_boom")
     async def boom():
@@ -62,7 +72,26 @@ def test_wrong_method_is_method_not_allowed_envelope(client):
     assert response.json() == {
         "error": {"code": "method_not_allowed", "message": "Method Not Allowed", "details": None}
     }
-    assert response.headers["allow"] == "GET"
+    assert {m.strip() for m in response.headers["allow"].split(",")} == {"GET", "HEAD"}
+
+
+def test_health_answers_head(client):
+    response = client.head("/health")
+    assert response.status_code == 200
+    assert response.content == b""
+
+
+def test_bodyless_status_has_no_body(probe):
+    response = probe.get("/_not_modified")
+    assert response.status_code == 304
+    assert response.content == b""
+    assert response.headers["etag"] == '"v1"'
+
+
+def test_structured_http_detail_goes_to_details(probe):
+    response = probe.get("/_structured")
+    assert response.status_code == 400
+    assert response.json() == {"error": {"code": "http_error", "message": "Bad Request", "details": {"field": "x"}}}
 
 
 def test_api_error_produces_exact_envelope(probe):
@@ -138,3 +167,10 @@ def test_create_app_reads_environment_when_no_settings_given(monkeypatch):
     app = create_app()
     assert app.state.settings.worker_count == 0
     assert app.state.settings.fake_llm_seed == 99
+
+
+def test_lifespan_logs_effective_settings(settings, clock, caplog):
+    caplog.set_level(logging.INFO, logger="app")
+    with TestClient(create_app(settings, clock=clock)):
+        pass
+    assert any("starting with Settings(" in r.getMessage() for r in caplog.records)
