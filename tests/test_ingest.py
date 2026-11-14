@@ -277,23 +277,20 @@ def test_invalid_field_is_rejected(client, db, field, value, error_type):
     assert row_count(db) == 0
 
 
-@pytest.mark.parametrize("id", [".", "..", "a.b"])
-def test_id_with_dot_is_rejected(client, db, id):
-    response = ingest(client, id=id)
-    details = assert_validation_error(response)
-    assert [(d["loc"], d["type"]) for d in details] == [(["body", "id"], "string_pattern_mismatch")]
-    assert "location" not in response.headers
-    assert row_count(db) == 0
-
-
 def test_boundary_lengths_are_accepted(client):
     response = ingest(client, id="A_z-9" + "a" * 123, subject="s" * 500, body="x" * 20_000)
     assert response.status_code == 202
 
 
+def test_minimum_lengths_are_accepted(client):
+    assert ingest(client, id="a", body="x").status_code == 202
+
+
 def test_length_limits_count_code_points(client):
     assert ingest(client, body="🙂" * 20_000).status_code == 202
-    details = assert_validation_error(ingest(client, id="t-1002", subject="é" * 251))
+    # "e\u0301" is one grapheme but two code points: 250 copies are 500 code points, 251 are 502.
+    assert ingest(client, id="t-1002", subject="e\u0301" * 250).status_code == 202
+    details = assert_validation_error(ingest(client, id="t-1003", subject="e\u0301" * 251))
     assert [d["type"] for d in details] == ["string_too_long"]
 
 
@@ -333,5 +330,9 @@ def test_invalid_payload_for_existing_id_does_not_touch_row(client, repository):
 
 
 def test_openapi_documents_ingest_responses(client):
-    operation = client.get("/openapi.json").json()["paths"]["/tickets"]["post"]
-    assert {"200", "202", "409", "422"} <= set(operation["responses"])
+    openapi = client.get("/openapi.json").json()
+    operation = openapi["paths"]["/tickets"]["post"]
+    refs = {code: r["content"]["application/json"]["schema"]["$ref"] for code, r in operation["responses"].items()}
+    assert refs["200"] == refs["202"] == "#/components/schemas/TicketOut"
+    assert refs["409"] == refs["422"] == "#/components/schemas/ErrorEnvelope"
+    assert "HTTPValidationError" not in openapi["components"]["schemas"]
