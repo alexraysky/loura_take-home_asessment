@@ -477,6 +477,15 @@ _HOWTO_RE = _cues(
     "could (?:i|we)",
     "what is the (?:best )?way",
 )
+# A causal clause after a how-to opener states why the customer asks. Temporal "since" ("since last
+# year", "since v2") only dates the question.
+_MONTHS = "january|february|march|april|may|june|july|august|september|october|november|december"
+_CAUSE_RE = _cues(
+    "because",
+    "now that",
+    "given that",
+    rf"since(?! (?:last|yesterday|today|{_DAYS}|{_MONTHS}|20\d\d|v\d|\d))",
+)
 # A whole sentence of closing courtesy ("Thanks again!", "Can't wait to hear back.") is not a
 # request, so its "again" or "can't" must not read as a follow-up or a blocker.
 _SIGN_OFF_RE = re.compile(
@@ -673,7 +682,7 @@ def classify_text(subject: str, body: str) -> dict[str, Any]:
     # Bare repeat wording ("still", "again") raises a ticket unless it only modifies a how-to
     # question ("How can I see my invoice again?"); a reported follow-up raises it even then.
     repeated = followed_up or bool(_REPEAT_RE.search(whole))
-    impaired = blocked or any(_states(_DEGRADED_RE, s) for s in sentences)
+    impaired = blocked or degraded
     if high:
         priority = "high"
     elif category == "other":
@@ -682,7 +691,7 @@ def classify_text(subject: str, body: str) -> dict[str, Any]:
         priority = "low"
     elif money_owed or deadline or repeated:
         priority = "medium"
-    elif category in ("technical", "account") and impaired:
+    elif impaired:
         priority = "medium"
     else:
         priority = "low"
@@ -698,6 +707,7 @@ def classify_text(subject: str, body: str) -> dict[str, Any]:
         money_owed=money_owed,
         deadline=deadline,
         feature=feature,
+        impaired=impaired,
         chasing=chasing,
     )
     return {
@@ -720,6 +730,7 @@ def _summary_for(
     money_owed: bool,
     deadline: bool,
     feature: bool,
+    impaired: bool,
     chasing: bool,
 ) -> str:
     # Templates only, never ticket text, so a summary can not echo or obey the ticket. The flags
@@ -734,6 +745,8 @@ def _summary_for(
             return _SUMMARIES[("billing", "medium")]
         if deadline:
             return "Customer needs a billing matter resolved before a stated deadline."
+        if impaired:
+            return "Customer reports a billing problem that blocks their request."
         return "Customer is following up on an unresolved billing problem."
     if priority == "medium" and chasing:
         return f"Customer is following up on an unresolved {category} request."
@@ -784,9 +797,16 @@ def _is_wide_problem(sentence: str) -> bool:
 def _reported_part(sentence: str) -> str:
     # Only wording before a how-to question is a report: "The API returns 503. How can I fix it?"
     # and "Dashboard is slow, how can I fix this?" report a problem, "How do I reduce latency?"
-    # asks about configuration.
+    # asks about configuration. A causal clause after it gives the reason for asking and is a
+    # report too: "Can I get help because all users are locked out?"
     howto = _HOWTO_RE.search(sentence)
-    return sentence[: howto.start()] if howto else sentence
+    if howto is None:
+        return sentence
+    before = sentence[: howto.start()]
+    cause = _CAUSE_RE.search(sentence, howto.end())
+    if cause is None:
+        return before
+    return f"{before} {sentence[cause.start() :]}" if before else sentence[cause.start() :]
 
 
 def _reports_incident(sentence: str) -> bool:

@@ -1334,3 +1334,48 @@ def test_when_clause_in_a_question_still_reports_the_problem(body):
     # "When" is not a conditional cue, so the error stays a reported problem.
     answer = classify_text("", body)
     assert (answer["category"], answer["priority"]) == ("technical", "medium")
+
+
+@pytest.mark.parametrize(
+    ("body", "category", "priority"),
+    [
+        ("Can I get help because all users are locked out?", "account", "high"),
+        ("Could we get an update since all users are locked out?", "account", "high"),
+        ("Can I get help since the API is down?", "technical", "high"),
+        ("Could I reset my password because I am locked out?", "account", "medium"),
+        ("How can I log in now that I am locked out?", "account", "medium"),
+        ("How do I configure retry handling when an export fails?", "technical", "low"),
+        ("How do I download my invoices since last year?", "billing", "low"),
+        ("How do I download invoices since 2023?", "billing", "low"),
+    ],
+)
+def test_a_causal_clause_after_a_how_to_opener_is_a_report(body, category, priority):
+    # "because", "now that", "given that" and non-temporal "since" give the reason for asking.
+    answer = classify_text("", body)
+    assert (answer["category"], answer["priority"]) == (category, priority)
+
+
+@pytest.mark.parametrize(
+    ("subject", "body"),
+    [
+        ("Payment failed", "My payment is not working and I cannot renew my subscription."),
+        ("", "My payment card failed and I cannot renew my subscription or pay my invoice."),
+    ],
+)
+def test_a_blocked_billing_request_is_medium_and_summarised_as_a_problem(subject, body):
+    answer = classify_text(subject, body)
+    assert (answer["category"], answer["priority"]) == ("billing", "medium")
+    assert answer["summary"] == "Customer reports a billing problem that blocks their request."
+
+
+def test_a_blocked_payment_with_an_equal_technical_failure_goes_technical():
+    # Two billing cues (pay, invoice) and two technical ones (returns a 502, error) tie, and ties
+    # go technical.
+    answer = classify_text("", "I cannot pay my invoice because checkout returns a 502 error.")
+    assert (answer["category"], answer["priority"]) == ("technical", "medium")
+
+
+def test_a_billing_follow_up_without_a_blocker_keeps_the_follow_up_summary():
+    answer = classify_text("", "Any update on my refund request?")
+    assert (answer["category"], answer["priority"]) == ("billing", "medium")
+    assert answer["summary"] == "Customer is following up on an unresolved billing problem."
