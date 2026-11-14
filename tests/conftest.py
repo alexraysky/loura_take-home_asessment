@@ -1,3 +1,4 @@
+import dataclasses
 from collections.abc import Iterator
 from datetime import UTC, datetime, timedelta
 
@@ -22,18 +23,8 @@ class FakeClock:
         self.now += timedelta(seconds=seconds)
 
 
-CONFIG_VARS = (
-    "DB_PATH",
-    "WORKER_COUNT",
-    "MAX_ATTEMPTS",
-    "LLM_TIMEOUT_S",
-    "LEASE_TIMEOUT_S",
-    "POLL_INTERVAL_S",
-    "BACKOFF_BASE_S",
-    "FAKE_LLM_SEED",
-    "FAKE_LLM_FAILURE_RATE",
-    "FAKE_LLM_GULLIBLE",
-)
+# Every Settings field is read from the upper-cased variable of the same name.
+CONFIG_VARS = tuple(f.name.upper() for f in dataclasses.fields(Settings))
 
 
 @pytest.fixture(autouse=True)

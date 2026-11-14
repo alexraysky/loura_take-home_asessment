@@ -35,7 +35,8 @@ class ApiError(Exception):
         self.details = details
 
 
-@router.api_route("/health", methods=["GET", "HEAD"], tags=["ops"])
+# Kept out of the OpenAPI schema: an ops probe, and GET+HEAD on one route would share an operation id.
+@router.api_route("/health", methods=["GET", "HEAD"], include_in_schema=False)
 async def health() -> dict[str, str]:
     """Readiness probe; not part of the ticket API."""
     return {"status": "ok"}

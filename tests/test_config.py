@@ -3,7 +3,6 @@ import dataclasses
 import pytest
 
 from app.config import MAX_ATTEMPTS, MAX_SECONDS, MAX_WORKER_COUNT, ConfigError, Settings
-from tests.conftest import CONFIG_VARS
 from app.main import create_app
 
 ALL_VARS = {
@@ -21,7 +20,7 @@ ALL_VARS = {
 
 
 def test_all_variables_are_covered():
-    assert set(ALL_VARS) == set(CONFIG_VARS)
+    assert set(ALL_VARS) == {f.name.upper() for f in dataclasses.fields(Settings)}
 
 
 def test_defaults_match_documented_table():
@@ -121,6 +120,8 @@ def test_lease_must_exceed_llm_timeout(env, fragment):
         ("LEASE_TIMEOUT_S", str(MAX_SECONDS + 1)),
         ("POLL_INTERVAL_S", str(MAX_SECONDS + 1)),
         ("BACKOFF_BASE_S", "1e308"),
+        ("POLL_INTERVAL_S", "5e-324"),
+        ("POLL_INTERVAL_S", "0.0009"),
     ],
 )
 def test_out_of_bounds_values_name_the_variable(name, raw):
@@ -156,6 +157,8 @@ def test_signed_and_padded_integers_are_accepted(raw):
         ("FAKE_LLM_SEED", "٣"),  # ARABIC-INDIC DIGIT THREE
         ("FAKE_LLM_SEED", "9" * 5000),
         ("LLM_TIMEOUT_S", "1_0.5"),
+        ("POLL_INTERVAL_S", "٣"),
+        ("POLL_INTERVAL_S", "０.５"),  # FULLWIDTH "0.5"
         ("LLM_TIMEOUT_S", "ten"),
         ("FAKE_LLM_GULLIBLE", "maybe"),
     ],
@@ -186,6 +189,8 @@ def test_non_finite_floats_are_rejected(name, raw):
         ({"poll_interval_s": "0.5"}, "POLL_INTERVAL_S"),
         ({"fake_llm_gullible": "false"}, "FAKE_LLM_GULLIBLE"),
         ({"fake_llm_gullible": 1}, "FAKE_LLM_GULLIBLE"),
+        ({"backoff_base_s": 10**400}, "BACKOFF_BASE_S"),
+        ({"fake_llm_seed": 10**18}, "FAKE_LLM_SEED"),
     ],
 )
 def test_direct_construction_is_validated_too(kwargs, name):

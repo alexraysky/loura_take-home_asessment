@@ -53,7 +53,7 @@ FAKE_LLM_FAILURE_RATE=0.2
 FAKE_LLM_GULLIBLE=true    the fake obeys injected instructions on the first attempt
 ```
 
-Unset or blank variables use the default; surrounding whitespace is ignored. Booleans accept `1/0`, `true/false`, `yes/no` and `on/off`, case-insensitive. Integers are plain ASCII digits with an optional sign.
+Unset or blank variables use the default; surrounding whitespace is ignored. Booleans accept `1/0`, `true/false`, `yes/no` and `on/off`, case-insensitive. Numbers are plain ASCII; integers are digits with an optional sign.
 
 The app refuses to start, naming the variable, when a value is malformed, not finite or out of bounds:
 
@@ -63,9 +63,10 @@ The app refuses to start, naming the variable, when a value is malformed, not fi
 | `MAX_ATTEMPTS` | 1 to 20 |
 | `LLM_TIMEOUT_S` | greater than 0, at most 86400 |
 | `LEASE_TIMEOUT_S` | greater than `LLM_TIMEOUT_S`, at most 86400 |
-| `POLL_INTERVAL_S` | greater than 0, at most 86400 |
+| `POLL_INTERVAL_S` | 0.001 to 86400 |
 | `BACKOFF_BASE_S` | 0 to 86400 |
 | `FAKE_LLM_FAILURE_RATE` | 0 to 1 |
+| `FAKE_LLM_SEED` | at most 18 digits |
 | `DB_PATH` | not blank |
 
 ## Layout

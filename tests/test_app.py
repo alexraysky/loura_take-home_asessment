@@ -1,6 +1,6 @@
-import pytest
 import logging
 
+import pytest
 from fastapi import FastAPI, HTTPException
 from fastapi.testclient import TestClient
 from pydantic import BaseModel, Field
@@ -40,6 +40,14 @@ def probe_app(app: FastAPI) -> FastAPI:
     async def structured():
         raise HTTPException(400, detail={"field": "x"})
 
+    @app.get("/_odd_status")
+    async def odd_status():
+        raise HTTPException(499)
+
+    @app.get("/_api_no_body")
+    async def api_no_body():
+        raise ApiError(304, "not_modified", "unused")
+
     @app.get("/_boom")
     async def boom():
         raise RuntimeError("secret internals")
@@ -78,6 +86,24 @@ def test_wrong_method_is_method_not_allowed_envelope(client):
 def test_health_answers_head(client):
     response = client.head("/health")
     assert response.status_code == 200
+    assert response.content == b""
+
+
+def test_openapi_schema_builds_without_warnings(client):
+    response = client.get("/openapi.json")
+    assert response.status_code == 200
+    assert "/health" not in response.json()["paths"]
+
+
+def test_unknown_status_code_still_has_a_message(probe):
+    response = probe.get("/_odd_status")
+    assert response.status_code == 499
+    assert response.json() == {"error": {"code": "http_error", "message": "HTTP error", "details": None}}
+
+
+def test_api_error_with_bodyless_status_has_no_body(probe):
+    response = probe.get("/_api_no_body")
+    assert response.status_code == 304
     assert response.content == b""
 
 

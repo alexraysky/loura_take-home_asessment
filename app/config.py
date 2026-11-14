@@ -18,6 +18,8 @@ _FLOAT_FIELDS = (
 MAX_WORKER_COUNT = 100
 MAX_ATTEMPTS = 20
 MAX_SECONDS = 86_400.0
+MIN_POLL_INTERVAL_S = 0.001
+MAX_SEED = 10**18 - 1
 _INT_RE = re.compile(r"[+-]?[0-9]{1,18}")
 _TRUE = frozenset({"1", "true", "yes", "on"})
 _FALSE = frozenset({"0", "false", "no", "off"})
@@ -64,8 +66,12 @@ class Settings:
                 f"LEASE_TIMEOUT_S ({self.lease_timeout_s}) must be greater than "
                 f"LLM_TIMEOUT_S ({self.llm_timeout_s})"
             )
-        if self.poll_interval_s <= 0:
-            raise ConfigError(f"POLL_INTERVAL_S must be greater than 0, got {self.poll_interval_s}")
+        if self.poll_interval_s < MIN_POLL_INTERVAL_S:
+            raise ConfigError(
+                f"POLL_INTERVAL_S must be at least {MIN_POLL_INTERVAL_S:g}, got {self.poll_interval_s}"
+            )
+        if abs(self.fake_llm_seed) > MAX_SEED:
+            raise ConfigError(f"FAKE_LLM_SEED must have at most 18 digits, got {self.fake_llm_seed}")
         if self.backoff_base_s < 0:
             raise ConfigError(f"BACKOFF_BASE_S must be 0 or greater, got {self.backoff_base_s}")
         if not 0.0 <= self.fake_llm_failure_rate <= 1.0:
@@ -87,7 +93,10 @@ class Settings:
             value = getattr(self, name)
             if isinstance(value, bool) or not isinstance(value, int | float):
                 raise ConfigError(f"{name.upper()} must be a number, got {value!r}")
-            object.__setattr__(self, name, float(value))
+            try:
+                object.__setattr__(self, name, float(value))
+            except OverflowError:
+                raise ConfigError(f"{name.upper()} must be a finite number, got {value!r}") from None
 
     @classmethod
     def from_env(cls, env: Mapping[str, str] | None = None) -> Settings:
@@ -136,7 +145,8 @@ def _float(env: Mapping[str, str], name: str, default: float) -> float:
     if raw is None:
         return default
     try:
-        if "_" in raw:
+        # float() alone would also accept "1_0" and non-ASCII digits.
+        if "_" in raw or not raw.isascii():
             raise ValueError(raw)
         value = float(raw)
     except ValueError:

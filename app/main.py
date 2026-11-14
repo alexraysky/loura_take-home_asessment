@@ -57,7 +57,9 @@ def error_response(
 
 def install_error_handlers(app: FastAPI) -> None:
     @app.exception_handler(ApiError)
-    async def on_api_error(_: Request, exc: ApiError) -> JSONResponse:
+    async def on_api_error(_: Request, exc: ApiError) -> Response:
+        if exc.status_code in _NO_BODY:
+            return Response(status_code=exc.status_code)
         return error_response(exc.status_code, exc.code, exc.message, exc.details)
 
     @app.exception_handler(RequestValidationError)
@@ -71,14 +73,15 @@ def install_error_handlers(app: FastAPI) -> None:
         if exc.status_code in _NO_BODY:
             return Response(status_code=exc.status_code, headers=exc.headers)
         code = _HTTP_CODES.get(exc.status_code, "http_error")
-        if isinstance(exc.detail, str):
+        if isinstance(exc.detail, str) and exc.detail:
             return error_response(exc.status_code, code, exc.detail, headers=exc.headers)
         # Structured detail goes to "details"; the message stays a readable string.
+        details = None if isinstance(exc.detail, str) else exc.detail
         try:
             message = HTTPStatus(exc.status_code).phrase
         except ValueError:
             message = "HTTP error"
-        return error_response(exc.status_code, code, message, exc.detail, headers=exc.headers)
+        return error_response(exc.status_code, code, message, details, headers=exc.headers)
 
     @app.exception_handler(Exception)
     async def on_unexpected(_: Request, exc: Exception) -> JSONResponse:
