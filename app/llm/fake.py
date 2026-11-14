@@ -708,7 +708,8 @@ def classify_text(subject: str, body: str) -> dict[str, Any]:
 
     # Bare repeat wording ("still", "again") raises a ticket unless it only modifies a how-to
     # question ("How can I see my invoice again?"); a reported follow-up raises it even then.
-    repeated = followed_up or bool(_REPEAT_RE.search(whole))
+    # "What if my export fails again?" only imagines a repeat.
+    repeated = followed_up or any(_states(_REPEAT_RE, s, reported=True) for s in sentences)
     impaired = blocked or degraded
     if high:
         priority = "high"
@@ -793,6 +794,11 @@ def _is_question(sentence: str) -> bool:
 
 def _reports_high_impact(sentence: str) -> bool:
     """Whether the sentence reports impact that makes a ticket high on its own."""
+    # "We had a production outage last year; how do I get the SLA report?" and "We had an outage
+    # last year." mention a past incident; wording that says it is still going on keeps it a report.
+    reported = _reported_part(sentence)
+    if _PAST_RE.search(reported) and not _ONGOING_RE.search(reported):
+        return False
     return (
         _reports_incident(sentence)
         or _is_wide_problem(sentence)
@@ -809,8 +815,9 @@ def _reports_blocker(sentence: str) -> bool:
 
 def _is_production_failure(sentence: str) -> bool:
     # "Our production API returns 500 errors, how can I fix it?" reports a failure; "How do I
-    # handle errors in production?" asks about one.
-    return bool(_PRODUCTION_RE.search(_reported_part(sentence)) and _states(_FAILURE_RE, sentence, reported=True))
+    # handle errors in production?" asks about one, and "Production is fine, but the staging export
+    # fails every time." puts production and the failure in different clauses.
+    return _states(_FAILURE_RE, sentence, reported=True, require=_PRODUCTION_RE)
 
 
 def _is_wide_problem(sentence: str) -> bool:
@@ -840,19 +847,22 @@ def _reported_part(sentence: str) -> str:
 def _reports_incident(sentence: str) -> bool:
     # "Our production API is down. What should we do?" reports an outage; "How do we handle a
     # production outage?", "How do I avoid an outage?" and "What happens if our site goes down?" ask
-    # about one, and "We had an outage last year; how do I get the SLA report?" mentions a past one.
-    if _is_question(sentence):
-        reported = _reported_part(sentence)
-        if _PAST_RE.search(reported) and not _ONGOING_RE.search(reported):
-            return False
+    # about one. Past incidents are filtered in _reports_high_impact.
     return _states(_INCIDENT_RE, sentence, reported=True)
 
 
-def _states(pattern: re.Pattern[str], sentence: str, *, reported: bool = False) -> bool:
+def _states(
+    pattern: re.Pattern[str],
+    sentence: str,
+    *,
+    reported: bool = False,
+    require: re.Pattern[str] | None = None,
+) -> bool:
     """Whether ``pattern`` matches in ``sentence`` without a hypothetical cue before it in its clause.
 
     A match right after a negation in its clause ("no outage") does not count. ``reported`` searches only the wording before a how-to question (see _reported_part). Bare
-    conditionals count as cues only when the whole sentence is a question.
+    conditionals count as cues only when the whole sentence is a question. ``require``, when given,
+    must also match in the clause of the match: "Production is fine, but the staging export fails."
 
     One pass over the matches and clause separators, each clause searched for a cue at most once,
     so a long body is never rescanned per match. Every impact cue starts on a word character after
@@ -871,8 +881,13 @@ def _states(pattern: re.Pattern[str], sentence: str, *, reported: bool = False) 
             separator = next(separators, None)
         if cue_end is None:
             clause_end = separator.start() if separator is not None else len(text)
-            cue = cues.search(text[clause_start:clause_end])
-            cue_end = clause_start + cue.end() if cue else len(text) + 1
+            clause = text[clause_start:clause_end]
+            if require is not None and not require.search(clause):
+                # No match in this clause counts: every one starts at or after clause_start.
+                cue_end = clause_start
+            else:
+                cue = cues.search(clause)
+                cue_end = clause_start + cue.end() if cue else len(text) + 1
         if cue_end > m.start() and not _NEGATED_RE.search(
             text, max(clause_start, m.start() - _NEGATION_WINDOW), m.start()
         ):
@@ -899,19 +914,16 @@ def _reports_deadline(sentence: str) -> bool:
 def _reports_follow_up(sentence: str) -> bool:
     # "I have asked twice and still have no response." is a follow-up, "How do I follow up on a
     # refund?" is a how-to question.
-    return bool(_FOLLOW_UP_RE.search(_reported_part(sentence)))
+    return _states(_FOLLOW_UP_RE, sentence, reported=True)
 
 
 def _reports_impact(sentence: str) -> bool:
     """Whether the sentence describes impact that sets priority, whatever its tone."""
     return bool(
-        _reports_incident(sentence)
+        _reports_high_impact(sentence)
         or _reports_blocker(sentence)
         or _reports_money_owed(sentence)
         or _reports_deadline(sentence)
-        or _is_wide_problem(sentence)
-        or _is_production_failure(sentence)
-        or _is_vulnerability_report(sentence)
         or _reports_degradation(sentence)
         or _reports_follow_up(sentence)
     )

@@ -844,6 +844,9 @@ def test_low_urgency_secondary_topic_does_not_score(body):
         ("How do I go about reporting a vulnerability?", "other"),
         ("Last month's outage report: where can I find it?", "technical"),
         ("We had an outage last year; how do I get the SLA report?", "technical"),
+        ("We had an outage last year. How do I get the SLA report?", "technical"),
+        ("We had a production outage last year; how do I get the SLA report?", "technical"),
+        ("We had a production outage last year. How do I get the SLA report?", "technical"),
     ],
 )
 def test_context_words_alone_do_not_raise_priority(body, category):
@@ -921,11 +924,17 @@ def test_how_to_questions_about_performance_stay_low(body):
         ("The revenue report export is slow.", "technical", "medium"),
         ("Everything works in production. In staging the export shows an error.", "technical", "medium"),
         ("Production is fine. The staging export fails every time.", "technical", "medium"),
+        ("Production is fine, but the staging export fails every time.", "technical", "medium"),
     ],
 )
 def test_production_and_revenue_without_an_outage_are_not_high(body, category, priority):
     answer = classify_text("Question", body)
     assert (answer["category"], answer["priority"]) == (category, priority)
+
+
+def test_failure_outside_the_production_clause_is_not_a_production_problem():
+    answer = classify_text("", "Production is fine, but the staging export fails every time.")
+    assert answer["summary"] == "Customer reports an error that blocks their work."
 
 
 @pytest.mark.parametrize("body", ["I need a down payment plan.", "How does the down payment work?"])
@@ -1125,6 +1134,23 @@ def test_preventive_and_hypothetical_incident_questions_are_not_high(body, categ
     answer = classify_text("", body)
     assert (answer["category"], answer["priority"]) == (category, "low")
     assert answer["summary"] == "Customer asks a technical question with no time pressure."
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        "What if my export fails again?",
+        "We want to prevent the API from failing again.",
+    ],
+)
+def test_hypothetical_repeat_failures_are_not_follow_ups(body):
+    answer = classify_text("", body)
+    assert (answer["category"], answer["priority"]) == ("technical", "low")
+    assert answer["summary"] == "Customer asks a technical question with no time pressure."
+
+
+def test_hypothetical_missing_reply_is_not_a_follow_up():
+    assert classify_text("", "What happens if there is still no response?")["priority"] == "low"
 
 
 def test_preventive_production_failure_question_is_not_high():
