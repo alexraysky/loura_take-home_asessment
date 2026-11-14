@@ -564,11 +564,12 @@ def classify_text(subject: str, body: str) -> dict[str, Any]:
 
     money_owed = bool(_MONEY_OWED_RE.search(whole))
     deadline = bool(_DEADLINE_RE.search(whole))
+    degraded = any(map(_reports_degradation, sentences))
     if high:
         priority = "high"
     elif category == "other":
         priority = "low"
-    elif _HOWTO_RE.search(whole) and not (blocked or money_owed or deadline):
+    elif _HOWTO_RE.search(whole) and not (blocked or money_owed or deadline or degraded):
         priority = "low"
     elif money_owed or deadline or _REPEAT_RE.search(whole):
         priority = "medium"
@@ -616,6 +617,14 @@ def _is_production_failure(sentence: str) -> bool:
     if not (_PRODUCTION_RE.search(sentence) and _FAILURE_RE.search(sentence)):
         return False
     return not _HOWTO_RE.search(sentence) or bool(_BLOCKED_RE.search(sentence))
+
+
+def _reports_degradation(sentence: str) -> bool:
+    # Only wording before a how-to question is a report: "The API returns 503. How can I fix it?"
+    # and "Dashboard is slow, how can I fix this?" report a problem, "How do I reduce latency?"
+    # asks about configuration.
+    howto = _HOWTO_RE.search(sentence)
+    return bool(_DEGRADED_RE.search(sentence[: howto.start()] if howto else sentence))
 
 
 def _is_vulnerability_report(sentence: str) -> bool:

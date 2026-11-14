@@ -843,6 +843,33 @@ def test_named_status_codes_are_technical_medium(body):
 
 
 @pytest.mark.parametrize(
+    "body",
+    [
+        "The API returns 503. How can I fix it?",
+        "Dashboard is slow, how can I fix this?",
+        "Exports keep timing out. Is there a way to speed them up?",
+        "We see latency spikes on the API. What is the best way to reduce them?",
+    ],
+)
+def test_reported_degradation_with_a_how_to_question_stays_medium(body):
+    answer = classify_text("", body)
+    assert (answer["category"], answer["priority"]) == ("technical", "medium")
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        "How do I reduce latency in the API config?",
+        "How can I set a longer timeout for API requests?",
+        "Is there a way to make the dashboard less slow to load on first visit?",
+    ],
+)
+def test_how_to_questions_about_performance_stay_low(body):
+    answer = classify_text("", body)
+    assert (answer["category"], answer["priority"]) == ("technical", "low")
+
+
+@pytest.mark.parametrize(
     ("body", "category", "priority"),
     [
         ("How do I set up SSO? I can't find the setting in production.", "account", "medium"),
