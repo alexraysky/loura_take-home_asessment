@@ -304,8 +304,8 @@ _EXPLOIT_RE = _cues(
     "unauthori[sz]ed",
     "other (?:users|customers|accounts|workspaces|tenants)",
 )
-# Wide-scale wording is high only next to a problem: "How do I export data for all users?" is a
-# how-to question, "30% of requests are timing out" is an incident.
+# Wide-scale wording is high only next to a problem in the same sentence: "How do I export data
+# for all users?" is a how-to question, "30% of requests are timing out" is an incident.
 _SCALE_RE = _cues(
     "all (?:our )?(?:users|customers)",
     "many users",
@@ -406,6 +406,17 @@ _HOWTO_RE = _cues(
     "can (?:i|we)",
     "could (?:i|we)",
     "what is the (?:best )?way",
+)
+# A whole sentence of closing courtesy ("Thanks again!", "Can't wait to hear back.") is not a
+# request, so its "again" or "can't" must not read as a follow-up or a blocker.
+_SIGN_OFF_RE = re.compile(
+    r"(?:(?:many |big )?(?:thanks|thank you|thx|cheers)(?: again)?(?: so much| very much| a lot)?"
+    r"(?: (?:again )?for (?:all )?(?:your|the) (?:help|time|support|patience|assistance))?"
+    r"|(?:can'?t|cannot) wait to hear (?:back|from you)"
+    r"|(?:talk|speak) (?:to you )?soon"
+    r"|looking forward to (?:hearing from you|hearing back|your reply)"
+    r"|(?:have a )?(?:great|nice|good) (?:day|week|weekend))"
+    r"[ !.,]*"
 )
 _INVOICE_RE = _cues("invoices?")
 _CATEGORY_CUES = {"technical": _TECHNICAL_RE, "billing": _BILLING_RE, "account": _ACCOUNT_RE}
@@ -533,11 +544,12 @@ class FakeLLM:
 def classify_text(subject: str, body: str) -> dict[str, Any]:
     """Honest answer for one ticket: the five answer fields in a fixed order."""
     injected = _is_injected(subject, body)
+    subject_sentences = _scoring_sentences(subject, injected)
+    subject_request = _has_request(subject_sentences)
     unquoted = _QUOTED_LINE_RE.sub("", body)
     # Quoted earlier messages are context, unless there is nothing else to go on.
-    primary = unquoted if _normalise(unquoted) else body
-    subject_sentences = _scoring_sentences(subject, injected)
-    body_sentences = _scoring_sentences(primary, injected)
+    primary = unquoted if subject_request or _normalise(unquoted) else body
+    body_sentences = _scoring_sentences(primary, injected, subject_request)
     sentences = subject_sentences + body_sentences
     ns = " ".join(subject_sentences)
     nb = " ".join(body_sentences)
@@ -546,13 +558,15 @@ def classify_text(subject: str, body: str) -> dict[str, Any]:
     scores = {
         name: 3 * len(cues.findall(ns)) + len(cues.findall(nb)) for name, cues in _CATEGORY_CUES.items()
     }
-    # max() keeps the first of equal scores, so ties go technical > billing > account.
-    best = max(scores, key=lambda name: scores[name])
+    # Equal scores go to the category of the sentences that report a blocker, so "I cannot change
+    # my email address. How do I export data?" is about the account. max() keeps the first of
+    # equal keys, so remaining ties go technical > billing > account.
+    reported = " ".join(s for s in sentences if _BLOCKED_RE.search(s))
+    best = max(scores, key=lambda name: (scores[name], len(_CATEGORY_CUES[name].findall(reported))))
     blocked = bool(_BLOCKED_RE.search(whole))
-    problem = blocked or bool(_PROBLEM_RE.search(whole))
     high = (
         bool(_INCIDENT_RE.search(whole))
-        or (problem and bool(_SCALE_RE.search(whole)))
+        or any(map(_is_wide_problem, sentences))
         or any(map(_is_production_failure, sentences))
         or any(map(_is_vulnerability_report, sentences))
     )
@@ -619,6 +633,16 @@ def _is_production_failure(sentence: str) -> bool:
     return not _HOWTO_RE.search(sentence) or bool(_BLOCKED_RE.search(sentence))
 
 
+def _is_wide_problem(sentence: str) -> bool:
+    # Scale counts only in the sentence that reports the problem: "I cannot change my email. How do
+    # I export data for all users?" is one blocked user and a how-to question.
+    if not _SCALE_RE.search(sentence):
+        return False
+    howto = _HOWTO_RE.search(sentence)
+    reported = sentence[: howto.start()] if howto else sentence
+    return bool(_BLOCKED_RE.search(sentence) or _PROBLEM_RE.search(reported))
+
+
 def _reports_degradation(sentence: str) -> bool:
     # Only wording before a how-to question is a report: "The API returns 503. How can I fix it?"
     # and "Dashboard is slow, how can I fix this?" report a problem, "How do I reduce latency?"
@@ -633,8 +657,16 @@ def _is_vulnerability_report(sentence: str) -> bool:
     return not _is_question(sentence) or bool(_EXPLOIT_RE.search(sentence))
 
 
-def _scoring_sentences(text: str, injected: bool) -> list[str]:
-    """Normalised sentences of ``text`` that count towards cues."""
+def _has_request(sentences: list[str]) -> bool:
+    return any(cue.search(sentence) for sentence in sentences for cue in _REQUEST_CUES)
+
+
+def _scoring_sentences(text: str, injected: bool, request_elsewhere: bool = False) -> list[str]:
+    """Normalised sentences of ``text`` that count towards cues.
+
+    ``request_elsewhere`` says the subject already carries a request, so deferred topics and
+    low-urgency asides in the body are dropped even when nothing else in the body remains.
+    """
     sentences = [s for s in map(_normalise, _SENTENCE_SPLIT_RE.split(text)) if s]
     # Phrases are matched on the whole normalised text, as _is_injected does, so a phrase broken
     # across a sentence or paragraph boundary marks every sentence it touches.
@@ -648,16 +680,16 @@ def _scoring_sentences(text: str, injected: bool) -> list[str]:
         hits = [m.span() for m in pattern.finditer(joined)]
         return [any(a < end and begin < b for a, b in hits) for begin, end in spans]
 
-    kept = list(range(len(sentences)))
+    kept = [i for i, sentence in enumerate(sentences) if not _SIGN_OFF_RE.fullmatch(sentence)]
     if injected:
         injection = marked(_INJECTION_RE)
         kept = [i for i in kept if not injection[i]]
-    # A deferred topic or a low-urgency aside is dropped only while another request remains, so a
-    # greeting or sign-off ("Thanks again!") never stands in for the only request.
+    # A deferred topic or a low-urgency aside is dropped only while another request remains, here
+    # or in the subject, so a greeting or sign-off never stands in for the only request.
     for pattern in (_DEFERRAL_RE, _LOW_URGENCY_RE):
         deferred = marked(pattern)
         rest = [i for i in kept if not deferred[i]]
-        if any(cue.search(sentences[i]) for i in rest for cue in _REQUEST_CUES):
+        if request_elsewhere or _has_request([sentences[i] for i in rest]):
             kept = rest
     return [sentences[i] for i in kept]
 

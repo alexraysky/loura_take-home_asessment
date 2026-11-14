@@ -953,3 +953,50 @@ def test_label_words_alone_score_nothing():
 def test_curly_apostrophes_are_normalised():
     answer = classify_text("Can\u2019t log in", "I can\u2019t log in to my account.")
     assert (answer["category"], answer["priority"]) == ("account", "medium")
+
+
+def test_scale_counts_only_in_the_sentence_that_reports_the_problem():
+    answer = classify_text("", "I cannot change my email address. How do I export data for all users?")
+    assert (answer["category"], answer["priority"]) == ("account", "medium")
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        "> Production is down and all users are blocked.",
+        "Separately, the API is down; I will open another ticket for that.",
+    ],
+)
+def test_a_request_in_the_subject_drops_contextual_body_text(body):
+    answer = classify_text("Where can I download my invoices?", body)
+    assert (answer["category"], answer["priority"]) == ("billing", "low")
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        "Please send my invoice. Thanks again!",
+        "Please send my invoice. Thanks again for your help.",
+        "Please send my invoice. Can't wait to hear back.",
+        "Please send my invoice. Talk soon!",
+        "Please send my invoice. Cheers again!",
+    ],
+)
+def test_sign_offs_are_not_follow_ups(body):
+    answer = classify_text("", body)
+    assert (answer["category"], answer["priority"]) == ("billing", "low")
+
+
+@pytest.mark.parametrize(
+    ("body", "category"),
+    [
+        ("Following up again on ticket #123 about my invoice.", "billing"),
+        ("I wrote earlier and still can't log in.", "account"),
+        ("Thanks, can you still help me since my refund is still missing?", "billing"),
+        ("Please send my invoice again.", "billing"),
+        ("Thanks again! My invoice is still missing.", "billing"),
+    ],
+)
+def test_real_follow_ups_stay_medium(body, category):
+    answer = classify_text("", body)
+    assert (answer["category"], answer["priority"]) == (category, "medium")
