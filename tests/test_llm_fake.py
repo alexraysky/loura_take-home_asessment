@@ -801,6 +801,8 @@ def test_low_urgency_secondary_topic_does_not_score(body):
         ("Our sales are down, how do I pause my subscription?", "billing"),
         ("Is there a vulnerability in the latest release I should know about?", "other"),
         ("How do I go about reporting a vulnerability?", "other"),
+        ("Last month's outage report: where can I find it?", "technical"),
+        ("We had an outage last year; how do I get the SLA report?", "technical"),
     ],
 )
 def test_context_words_alone_do_not_raise_priority(body, category):
@@ -980,6 +982,8 @@ def test_a_request_in_the_subject_drops_contextual_body_text(body):
         "Please send my invoice. Can't wait to hear back.",
         "Please send my invoice. Talk soon!",
         "Please send my invoice. Cheers again!",
+        "Please send my invoice. Thank you so much again!",
+        "Please send my invoice. Thanks so much again!",
     ],
 )
 def test_sign_offs_are_not_follow_ups(body):
@@ -1159,6 +1163,56 @@ def test_reported_blockers_and_vulnerabilities_still_score(body, category, prior
 
 
 @pytest.mark.parametrize(
+    ("body", "category", "priority"),
+    [
+        ("Even if I reset my password I can't log in.", "account", "medium"),
+        ("I tried everything to avoid it and now I am locked out.", "account", "medium"),
+        ("Whether I use Chrome or Firefox the export fails.", "technical", "medium"),
+        ("Not sure if anyone noticed the API is down.", "technical", "high"),
+        ("I wonder if you know the API is down for all users.", "technical", "high"),
+    ],
+)
+def test_conditionals_in_statements_do_not_hide_reported_impact(body, category, priority):
+    answer = classify_text("", body)
+    assert (answer["category"], answer["priority"]) == (category, priority)
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        "How can I avoid being charged twice?",
+        "How do I prevent a duplicate charge?",
+        "If I am charged twice, how do I get a refund?",
+        "What happens if I am overcharged?",
+        "Is there a deadline to upgrade my plan?",
+    ],
+)
+def test_questions_about_money_owed_or_deadlines_stay_low(body):
+    answer = classify_text("", body)
+    assert (answer["category"], answer["priority"]) == ("billing", "low")
+    assert answer["summary"] == "Customer asks a question about billing."
+
+
+def test_an_ongoing_outage_before_a_question_stays_high():
+    answer = classify_text("", "Our API has been down since last week, how do I fix it?")
+    assert (answer["category"], answer["priority"]) == ("technical", "high")
+
+
+@pytest.mark.parametrize(
+    ("body", "priority"),
+    [
+        ("I'm having trouble logging in.", "medium"),
+        ("Help, I keep having problems signing in.", "medium"),
+        ("I would love some help logging in.", "low"),
+        ("How do I log on with SSO?", "low"),
+    ],
+)
+def test_progressive_login_wording_is_account(body, priority):
+    answer = classify_text("", body)
+    assert (answer["category"], answer["priority"]) == ("account", priority)
+
+
+@pytest.mark.parametrize(
     ("body", "category", "priority", "summary"),
     [
         (
@@ -1197,7 +1251,7 @@ def test_real_feature_requests_stay_other_low(body):
 @pytest.mark.parametrize(
     "body",
     [
-        "if " + "error " * 3300,
+        "What if " + "error " * 3300 + "?",
         "What happens if " + "locked out " * 1800,
         "We want to prevent " + "api is down " * 1600,
     ],

@@ -189,7 +189,10 @@ _BILLING_RE = _cues(
 _ACCOUNT_RE = _cues(
     "log ?in",
     "logged in",
+    "logging in",
+    "log(?:ging)? ?on",
     "sign ?in",
+    "signing in",
     "password",
     "reset link",
     "locked out",
@@ -266,11 +269,16 @@ _VULN = (
     r"(?! (?:disclosure|bounty|program|programme|policy|reporting|scans?|management))"
 )
 _DAYS = "monday|tuesday|wednesday|thursday|friday|saturday|sunday|tomorrow"
+# An outage named as a topic ("outage report", "outage credits") is not a reported outage.
+_OUTAGE = (
+    r"outage(?! (?:reports?|history|postmortems?|post-mortems?|credits?|sla|notifications?|alerts?"
+    r"|policy|page|status page))"
+)
 # Impact that makes a ticket high on its own.
 _INCIDENT_RE = _cues(
-    "outage",
+    _OUTAGE,
     _DOWN,
-    "production (?:is )?(?:outage|down|incident|failure|crash(?:es|ed)?|broken|issues?|errors?)",
+    rf"production (?:is )?(?:{_OUTAGE}|down|incident|failure|crash(?:es|ed)?|broken|issues?|errors?)",
     "data loss",
     "lost data",
     "deleted (?:all|our)",
@@ -290,24 +298,33 @@ _INCIDENT_RE = _cues(
 # Preventive or hypothetical wording turns impact words into a question about them: "How can I
 # prevent data loss?", "What happens if all users are locked out?", "We want to avoid an outage."
 # Every impact check goes through _states, so the cue applies to incidents, scale, blockers,
-# degradation and vulnerabilities alike.
-_HYPOTHETICAL_RE = _cues(
+# degradation, vulnerabilities, money owed and deadlines alike.
+_PREVENTIVE = (
     "avoid(?:s|ed|ing)?",
     "prevent(?:s|ed|ing)?",
     "(?:protect|guard) against",
     "prepare for",
     "plan for",
-    "in case",
-    "in the event",
     "risk of",
-    "if",
-    "whether",
-    "suppose",
     "what (?:happens|would happen)",
 )
+# A bare conditional is hypothetical only in a question ("What if I can't log in?"). In a
+# statement it frames a fact: "Even if I reset my password I can't log in.", "Whether I use
+# Chrome or Firefox the export fails.", "Not sure if anyone noticed the API is down."
+_CONDITIONAL = ("in case", "in the event", "(?<!even )if", "whether", "suppose")
+_PREVENTIVE_RE = _cues(*_PREVENTIVE)
+_HYPOTHETICAL_RE = _cues(*_PREVENTIVE, *_CONDITIONAL)
 # The cue counts only in the same clause, before the impact words: "We tried to prevent it, but
-# now the API is down." still reports an outage.
-_CLAUSE_SPLIT_RE = re.compile(r"[,;:]| but ")
+# now the API is down." and "I tried to avoid it and now I am locked out." still report the problem.
+_CLAUSE_SPLIT_RE = re.compile(r"[,;:]| but | yet | (?:and|so) (?:now|then|still) ")
+# A past incident mentioned before a question is context, not a report: "We had an outage last
+# year; how do I get the SLA report?". Wording that says it is still going on keeps it a report.
+_PAST_RE = _cues(
+    "last (?:year|month|week|quarter)",
+    r"(?:\w+ )?(?:weeks|months|years) ago",
+    r"in 20\d\d",
+)
+_ONGOING_RE = _cues("still", "now", "currently", "again", "ongoing", "since", "today")
 # A reported vulnerability is high, but "Is there a vulnerability I should know about?" and "How do
 # I report a vulnerability?" are questions; a question is high only when it names an exploit.
 _VULN_RE = _cues(
@@ -343,7 +360,7 @@ _SCALE_RE = _cues(
 # 500 errors in production" is an incident. Only verb forms count, never the noun "error".
 _PRODUCTION_RE = _cues("production", "prod")
 _FAILURE_RE = _cues(
-    "outage",
+    _OUTAGE,
     _DOWN,
     _status(r"5\d\d"),
     r"(?:throws?|throwing|returns?|returning|returned|getting|got) (?:an? |the )?" + _ERROR,
@@ -385,6 +402,7 @@ _BLOCKED_RE = _cues(
     "crash(?:es|ed)?",
     "won'?t",
     "no longer",
+    "(?:trouble|problems?|difficulty) (?:logging|signing) (?:in|on)",
 )
 _DOUBLE_CHARGE_RE = _cues("charged twice", "two charges", "double charge[d]?", "duplicate charge")
 _MONEY_OWED_RE = _cues(
@@ -408,6 +426,11 @@ _DEADLINE_RE = _cues(
     f"by (?:{_DAYS}|end of (?:the )?(?:day|week|month))",
     "end of month",
     "cut-?off",
+)
+# "Is there a deadline to upgrade my plan?" asks about a deadline; it does not state one.
+_DEADLINE_QUESTION_RE = _cues(
+    r"(?:is|are) there (?:a |any )?(?:\w+ ){0,2}(?:deadlines?|due dates?|cut-?offs?)",
+    r"(?:when|what) (?:is|are|'s) (?:the |my |our )?(?:\w+ ){0,2}(?:deadlines?|due dates?|cut-?offs?)",
 )
 _REPEAT_RE = _cues(
     "still",
@@ -447,7 +470,7 @@ _HOWTO_RE = _cues(
 # A whole sentence of closing courtesy ("Thanks again!", "Can't wait to hear back.") is not a
 # request, so its "again" or "can't" must not read as a follow-up or a blocker.
 _SIGN_OFF_RE = re.compile(
-    r"(?:(?:many |big )?(?:thanks|thank you|thx|cheers)(?: again)?(?: so much| very much| a lot)?"
+    r"(?:(?:many |big )?(?:thanks|thank you|thx|cheers)(?: again)?(?: so much| very much| a lot)?(?: again)?"
     r"(?: (?:again )?for (?:all )?(?:your|the) (?:help|time|support|patience|assistance))?"
     r"|(?:can'?t|cannot) wait to hear (?:back|from you)"
     r"|(?:talk|speak) (?:to you )?soon"
@@ -602,8 +625,10 @@ def classify_text(subject: str, body: str) -> dict[str, Any]:
     best = max(scores, key=lambda name: (scores[name], len(_CATEGORY_CUES[name].findall(reported))))
     blocked = any(map(_reports_blocker, sentences))
     high = any(map(_reports_high_impact, sentences))
-    money_owed = bool(_MONEY_OWED_RE.search(whole))
-    deadline = bool(_DEADLINE_RE.search(whole))
+    # "How can I avoid being charged twice?" and "Is there a deadline to upgrade?" state neither.
+    double_charged = any(_states(_DOUBLE_CHARGE_RE, s, reported=True) for s in sentences)
+    money_owed = any(map(_reports_money_owed, sentences))
+    deadline = any(map(_reports_deadline, sentences))
     degraded = any(map(_reports_degradation, sentences))
     followed_up = any(map(_reports_follow_up, sentences))
     # Suggestion wording next to a reported problem ("Our export is timing out. Would love help
@@ -633,28 +658,51 @@ def classify_text(subject: str, body: str) -> dict[str, Any]:
         priority = "low"
 
     chasing = repeated and not (impaired or money_owed or deadline)
+    summary = _summary_for(
+        category,
+        priority,
+        whole,
+        subject,
+        body,
+        double_charged=double_charged,
+        money_owed=money_owed,
+        deadline=deadline,
+        feature=feature,
+        chasing=chasing,
+    )
     return {
         "category": category,
         "priority": priority,
-        "summary": _summary_for(category, priority, whole, feature, chasing, subject, body),
+        "summary": summary,
         "flagged": injected,
         "flag_reason": FLAG_REASON_INJECTION if injected else None,
     }
 
 
 def _summary_for(
-    category: str, priority: str, whole: str, feature: bool, chasing: bool, subject: str, body: str
+    category: str,
+    priority: str,
+    whole: str,
+    subject: str,
+    body: str,
+    *,
+    double_charged: bool,
+    money_owed: bool,
+    deadline: bool,
+    feature: bool,
+    chasing: bool,
 ) -> str:
-    # Templates only, never ticket text, so a summary can not echo or obey the ticket.
+    # Templates only, never ticket text, so a summary can not echo or obey the ticket. The flags
+    # are the ones that set the priority, so a summary never states what the ticket only asks about.
     # ``chasing`` says a follow-up is the only reason for a medium priority.
     if priority == "high":
         return _SUMMARIES[("technical", "high")] if category == "technical" else _SEVERE
     if category == "billing" and priority == "medium":
-        if _DOUBLE_CHARGE_RE.search(whole):
+        if double_charged:
             return "Customer was charged twice and requests a refund of one charge."
-        if _MONEY_OWED_RE.search(whole):
+        if money_owed:
             return _SUMMARIES[("billing", "medium")]
-        if _DEADLINE_RE.search(whole):
+        if deadline:
             return "Customer needs a billing matter resolved before a stated deadline."
         return "Customer is following up on an unresolved billing problem."
     if priority == "medium" and chasing:
@@ -699,7 +747,7 @@ def _is_wide_problem(sentence: str) -> bool:
     # I export data for all users?" is one blocked user and a how-to question.
     if not _states(_SCALE_RE, sentence):
         return False
-    return _reports_blocker(sentence) or _states(_PROBLEM_RE, _reported_part(sentence))
+    return _reports_blocker(sentence) or _states(_PROBLEM_RE, sentence, reported=True)
 
 
 def _reported_part(sentence: str) -> str:
@@ -713,18 +761,28 @@ def _reported_part(sentence: str) -> str:
 def _reports_incident(sentence: str) -> bool:
     # "Our production API is down. What should we do?" reports an outage; "How do we handle a
     # production outage?", "How do I avoid an outage?" and "What happens if our site goes down?" ask
-    # about one.
-    return _states(_INCIDENT_RE, _reported_part(sentence))
+    # about one, and "We had an outage last year; how do I get the SLA report?" mentions a past one.
+    if _is_question(sentence):
+        reported = _reported_part(sentence)
+        if _PAST_RE.search(reported) and not _ONGOING_RE.search(reported):
+            return False
+    return _states(_INCIDENT_RE, sentence, reported=True)
 
 
-def _states(pattern: re.Pattern[str], text: str) -> bool:
-    """Whether ``pattern`` matches in ``text`` without a hypothetical cue before it in its clause.
+def _states(pattern: re.Pattern[str], sentence: str, *, reported: bool = False) -> bool:
+    """Whether ``pattern`` matches in ``sentence`` without a hypothetical cue before it in its clause.
+
+    ``reported`` searches only the wording before a how-to question (see _reported_part). Bare
+    conditionals count as cues only when the whole sentence is a question.
 
     One pass over the matches and clause separators, each clause searched for a cue at most once,
     so a long body is never rescanned per match. Every impact cue starts on a word character after
     a word boundary and every hypothetical cue ends on one, so a cue precedes a match exactly when
-    the clause's first cue ends at or before the match starts.
+    the clause's first cue ends at or before the match starts. No impact cue contains a clause
+    separator, so no match spans two clauses.
     """
+    text = _reported_part(sentence) if reported else sentence
+    cues = _HYPOTHETICAL_RE if _is_question(sentence) else _PREVENTIVE_RE
     separators = _CLAUSE_SPLIT_RE.finditer(text)
     separator = next(separators, None)
     clause_start, cue_end = 0, None
@@ -734,7 +792,7 @@ def _states(pattern: re.Pattern[str], text: str) -> bool:
             separator = next(separators, None)
         if cue_end is None:
             clause_end = separator.start() if separator is not None else len(text)
-            cue = _HYPOTHETICAL_RE.search(text[clause_start:clause_end])
+            cue = cues.search(text[clause_start:clause_end])
             cue_end = clause_start + cue.end() if cue else len(text) + 1
         if cue_end > m.start():
             return True
@@ -742,7 +800,19 @@ def _states(pattern: re.Pattern[str], text: str) -> bool:
 
 
 def _reports_degradation(sentence: str) -> bool:
-    return _states(_DEGRADED_RE, _reported_part(sentence))
+    return _states(_DEGRADED_RE, sentence, reported=True)
+
+
+def _reports_money_owed(sentence: str) -> bool:
+    # "I was charged twice, how do I get a refund?" reports money owed; "How do I prevent a
+    # duplicate charge?" and "What happens if I am overcharged?" ask about it.
+    return _states(_MONEY_OWED_RE, sentence, reported=True)
+
+
+def _reports_deadline(sentence: str) -> bool:
+    if _is_question(sentence) and _DEADLINE_QUESTION_RE.search(sentence):
+        return False
+    return _states(_DEADLINE_RE, sentence, reported=True)
 
 
 def _reports_follow_up(sentence: str) -> bool:
@@ -756,8 +826,8 @@ def _reports_impact(sentence: str) -> bool:
     return bool(
         _reports_incident(sentence)
         or _reports_blocker(sentence)
-        or _MONEY_OWED_RE.search(sentence)
-        or _DEADLINE_RE.search(sentence)
+        or _reports_money_owed(sentence)
+        or _reports_deadline(sentence)
         or _is_wide_problem(sentence)
         or _is_production_failure(sentence)
         or _is_vulnerability_report(sentence)
