@@ -248,7 +248,8 @@ _FEATURE_RE = _cues(
     "feature request",
     "feature",
     "would be (?:great|nice|helpful)",
-    "would love",
+    # "Would love help with this." asks for support, not a feature.
+    r"would love(?! (?:some |your |any )?(?:help|assistance|support|guidance|advice|to hear))",
     "suggestion",
     "suggest",
     "please add",
@@ -286,8 +287,10 @@ _INCIDENT_RE = _cues(
     "lost (?:revenue|sales|orders)",
     "revenue loss",
 )
-# Preventive or hypothetical wording turns incident words into a question about one: "How can I
-# prevent data loss?", "What happens if our site goes down?", "We want to avoid an outage."
+# Preventive or hypothetical wording turns impact words into a question about them: "How can I
+# prevent data loss?", "What happens if all users are locked out?", "We want to avoid an outage."
+# Every impact check goes through _states, so the cue applies to incidents, scale, blockers,
+# degradation and vulnerabilities alike.
 _HYPOTHETICAL_RE = _cues(
     "avoid(?:s|ed|ing)?",
     "prevent(?:s|ed|ing)?",
@@ -302,7 +305,7 @@ _HYPOTHETICAL_RE = _cues(
     "suppose",
     "what (?:happens|would happen)",
 )
-# The cue counts only in the same clause, before the incident words: "We tried to prevent it, but
+# The cue counts only in the same clause, before the impact words: "We tried to prevent it, but
 # now the API is down." still reports an outage.
 _CLAUSE_SPLIT_RE = re.compile(r"[,;:]| but ")
 # A reported vulnerability is high, but "Is there a vulnerability I should know about?" and "How do
@@ -311,7 +314,7 @@ _VULN_RE = _cues(
     rf"(?:security|critical|severe|serious|zero-day|0-day|unpatched) {_VULN}",
     rf"(?:found|discovered|identified|reporting|exploited|exploitable)"
     rf" (?:a |an |the |this )?(?:\w+ ){{0,2}}{_VULN}",
-    rf"{_VULN} (?:in|on) (?:your|the)",
+    rf"{_VULN} (?:in|on) (?:your|the|our|prod|production)",
 )
 _QUESTION_RE = _cues("is there", "are there")
 _EXPLOIT_RE = _cues(
@@ -595,29 +598,27 @@ def classify_text(subject: str, body: str) -> dict[str, Any]:
     # Equal scores go to the category of the sentences that report a blocker, so "I cannot change
     # my email address. How do I export data?" is about the account. max() keeps the first of
     # equal keys, so remaining ties go technical > billing > account.
-    reported = " ".join(s for s in sentences if _BLOCKED_RE.search(s))
+    reported = " ".join(s for s in sentences if _reports_blocker(s))
     best = max(scores, key=lambda name: (scores[name], len(_CATEGORY_CUES[name].findall(reported))))
-    blocked = bool(_BLOCKED_RE.search(whole))
-    high = (
-        any(map(_reports_incident, sentences))
-        or any(map(_is_wide_problem, sentences))
-        or any(map(_is_production_failure, sentences))
-        or any(map(_is_vulnerability_report, sentences))
-    )
-    feature = bool(_FEATURE_RE.search(whole))
-    if scores[best] == 0 or (feature and not (high or blocked)):
-        category = "other"
-    else:
-        category = best
-
+    blocked = any(map(_reports_blocker, sentences))
+    high = any(map(_reports_high_impact, sentences))
     money_owed = bool(_MONEY_OWED_RE.search(whole))
     deadline = bool(_DEADLINE_RE.search(whole))
     degraded = any(map(_reports_degradation, sentences))
     followed_up = any(map(_reports_follow_up, sentences))
+    # Suggestion wording next to a reported problem ("Our export is timing out. Would love help
+    # with this.") does not turn the problem into a feature request.
+    feature = bool(_FEATURE_RE.search(whole))
+    problem = high or blocked or degraded or money_owed or deadline or followed_up
+    if scores[best] == 0 or (feature and not problem):
+        category = "other"
+    else:
+        category = best
+
     # Bare repeat wording ("still", "again") raises a ticket unless it only modifies a how-to
     # question ("How can I see my invoice again?"); a reported follow-up raises it even then.
     repeated = followed_up or bool(_REPEAT_RE.search(whole))
-    impaired = blocked or bool(_DEGRADED_RE.search(whole))
+    impaired = blocked or any(_states(_DEGRADED_RE, s) for s in sentences)
     if high:
         priority = "high"
     elif category == "other":
@@ -672,20 +673,33 @@ def _is_question(sentence: str) -> bool:
     return sentence.endswith("?") or bool(_HOWTO_RE.search(sentence) or _QUESTION_RE.search(sentence))
 
 
+def _reports_high_impact(sentence: str) -> bool:
+    """Whether the sentence reports impact that makes a ticket high on its own."""
+    return (
+        _reports_incident(sentence)
+        or _is_wide_problem(sentence)
+        or _is_production_failure(sentence)
+        or _is_vulnerability_report(sentence)
+    )
+
+
+def _reports_blocker(sentence: str) -> bool:
+    # "I am locked out." reports a blocker, "What happens if all users are locked out?" asks about one.
+    return _states(_BLOCKED_RE, sentence)
+
+
 def _is_production_failure(sentence: str) -> bool:
     if not (_PRODUCTION_RE.search(sentence) and _states(_FAILURE_RE, sentence)):
         return False
-    return not _HOWTO_RE.search(sentence) or bool(_BLOCKED_RE.search(sentence))
+    return not _HOWTO_RE.search(sentence) or _reports_blocker(sentence)
 
 
 def _is_wide_problem(sentence: str) -> bool:
     # Scale counts only in the sentence that reports the problem: "I cannot change my email. How do
     # I export data for all users?" is one blocked user and a how-to question.
-    if not _SCALE_RE.search(sentence):
+    if not _states(_SCALE_RE, sentence):
         return False
-    howto = _HOWTO_RE.search(sentence)
-    reported = sentence[: howto.start()] if howto else sentence
-    return bool(_BLOCKED_RE.search(sentence) or _PROBLEM_RE.search(reported))
+    return _reports_blocker(sentence) or _states(_PROBLEM_RE, _reported_part(sentence))
 
 
 def _reported_part(sentence: str) -> str:
@@ -711,7 +725,7 @@ def _states(pattern: re.Pattern[str], text: str) -> bool:
 
 
 def _reports_degradation(sentence: str) -> bool:
-    return bool(_DEGRADED_RE.search(_reported_part(sentence)))
+    return _states(_DEGRADED_RE, _reported_part(sentence))
 
 
 def _reports_follow_up(sentence: str) -> bool:
@@ -724,7 +738,7 @@ def _reports_impact(sentence: str) -> bool:
     """Whether the sentence describes impact that sets priority, whatever its tone."""
     return bool(
         _reports_incident(sentence)
-        or _BLOCKED_RE.search(sentence)
+        or _reports_blocker(sentence)
         or _MONEY_OWED_RE.search(sentence)
         or _DEADLINE_RE.search(sentence)
         or _is_wide_problem(sentence)
@@ -736,7 +750,9 @@ def _reports_impact(sentence: str) -> bool:
 
 
 def _is_vulnerability_report(sentence: str) -> bool:
-    if not _VULN_RE.search(sentence):
+    # "We found a vulnerability in your API." is a report, "We want to prevent a security
+    # vulnerability in the API." is not.
+    if not _states(_VULN_RE, sentence):
         return False
     return not _is_question(sentence) or bool(_EXPLOIT_RE.search(sentence))
 

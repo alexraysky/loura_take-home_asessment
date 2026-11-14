@@ -1118,3 +1118,77 @@ def test_repeat_word_in_a_how_to_question_does_not_use_the_follow_up_summary():
     answer = classify_text("", "How can I see my invoice again?")
     assert (answer["category"], answer["priority"]) == ("billing", "low")
     assert answer["summary"] == "Customer asks where to download invoices."
+
+
+@pytest.mark.parametrize(
+    ("body", "category", "summary"),
+    [
+        (
+            "What happens if all users are locked out?",
+            "account",
+            "Customer asks how to change an account setting.",
+        ),
+        ("What if I can't log in?", "account", "Customer asks how to change an account setting."),
+        (
+            "We want to prevent a security vulnerability in the API.",
+            "technical",
+            "Customer asks a technical question with no time pressure.",
+        ),
+        ("How do I avoid a failure?", "technical", "Customer asks a technical question with no time pressure."),
+    ],
+)
+def test_hypothetical_scale_blockers_and_vulnerabilities_do_not_raise_priority(body, category, summary):
+    answer = classify_text("", body)
+    assert (answer["category"], answer["priority"]) == (category, "low")
+    assert answer["summary"] == summary
+
+
+@pytest.mark.parametrize(
+    ("body", "category", "priority"),
+    [
+        ("I am locked out.", "account", "medium"),
+        ("All users are locked out.", "account", "high"),
+        ("We found a security vulnerability in your API.", "technical", "high"),
+        ("We have a vulnerability in prod.", "other", "high"),
+        ("If I try to log in, I get an error.", "technical", "medium"),
+    ],
+)
+def test_reported_blockers_and_vulnerabilities_still_score(body, category, priority):
+    answer = classify_text("", body)
+    assert (answer["category"], answer["priority"]) == (category, priority)
+
+
+@pytest.mark.parametrize(
+    ("body", "category", "priority", "summary"),
+    [
+        (
+            "Our export is timing out. Would love help with this.",
+            "technical",
+            "medium",
+            "Customer reports an error that blocks their work.",
+        ),
+        (
+            "I was overcharged. Would love a refund.",
+            "billing",
+            "medium",
+            "Customer reports a billing problem that is costing them money and asks for it to be corrected.",
+        ),
+        (
+            "How do I export my data? Would love help.",
+            "technical",
+            "low",
+            "Customer asks a technical question with no time pressure.",
+        ),
+    ],
+)
+def test_suggestion_wording_does_not_hide_a_reported_problem(body, category, priority, summary):
+    answer = classify_text("", body)
+    assert (answer["category"], answer["priority"]) == (category, priority)
+    assert answer["summary"] == summary
+
+
+@pytest.mark.parametrize("body", ["Would love a dark mode!", "Feature request: please add dark mode."])
+def test_real_feature_requests_stay_other_low(body):
+    answer = classify_text("", body)
+    assert (answer["category"], answer["priority"]) == ("other", "low")
+    assert answer["summary"] == "Customer suggests a new feature."
