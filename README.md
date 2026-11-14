@@ -36,6 +36,71 @@ uv run pytest
 uv run python -m app.seed --base-url http://127.0.0.1:8000
 ```
 
+## API
+
+### `POST /tickets`
+
+```sh
+curl -i -X POST http://127.0.0.1:8000/tickets \
+  -H 'content-type: application/json' \
+  -d '{"id": "t-1001", "subject": "Charged twice this month", "body": "Hi, I see two charges..."}'
+```
+
+| Field | Rules |
+|---|---|
+| `id` | Required string, 1 to 128 characters, matching `^[A-Za-z0-9_-]+$` (letters, digits, `_` and `-`; no `.`) |
+| `subject` | Optional string, at most 500 characters, defaults to `""`; `null` is rejected |
+| `body` | Required string, 1 to 20,000 characters |
+
+Unknown fields are rejected and values are never coerced (a number is not a string). Limits count Unicode code points. Subject and body are stored and returned exactly as received: no trimming or normalisation.
+
+The id makes the request idempotent:
+
+| Case | Response |
+|---|---|
+| New id | `202 Accepted`, the ticket with `status: "pending"`, `Location: /tickets/{id}` |
+| Existing id, identical `subject` and `body` | `200 OK`, the stored ticket in its current state; nothing is written or requeued |
+| Existing id, different `subject` or `body` | `409 Conflict`, code `ticket_conflict`; the stored ticket is unchanged |
+| Invalid payload (malformed JSON, or JSON that fails the rules above) | `422`, code `validation_error` |
+| Body that cannot be decoded or parsed before validation (for example undecodable UTF-8/16/32 bytes, or JSON nested too deeply) | `400`, code `http_error` |
+
+An omitted `subject` and `"subject": ""` are the same payload. Comparison is exact, so a whitespace or line-ending difference is a conflict.
+
+### Ticket representation
+
+```json
+{
+  "id": "t-1001",
+  "subject": "Charged twice this month",
+  "body": "Hi, I see two charges...",
+  "status": "pending",
+  "category": null,
+  "priority": null,
+  "summary": null,
+  "flagged": false,
+  "flag_reason": null,
+  "attempts": 0,
+  "last_error": null,
+  "prompt_version": null,
+  "created_at": "2026-11-14T12:00:00.000000Z",
+  "updated_at": "2026-11-14T12:00:00.000000Z"
+}
+```
+
+`claimed_at` and `next_attempt_at` are internal queue columns and are never returned.
+
+### Errors
+
+Every error uses one envelope:
+
+```json
+{"error": {"code": "ticket_conflict", "message": "Ticket t-1001 already exists with different content.", "details": null}}
+```
+
+For `validation_error`, `details` lists one `{"loc", "msg", "type"}` entry per problem. Submitted values are never echoed back.
+
+Read endpoints arrive with #9 and the sample loader with #10.
+
 ## Configuration
 
 Environment variables with defaults:
