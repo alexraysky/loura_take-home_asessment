@@ -143,6 +143,10 @@ Every error uses one envelope:
 | `ticket_conflict` | 409 | `POST /tickets` with an existing id and different content |
 | `ticket_not_found` | 404 | `GET /tickets/{id}` with an id that is not stored |
 | `invalid_cursor` | 400 | `GET /tickets` with a cursor the service did not produce |
+| `http_error` | 400 | `POST /tickets` with a body that cannot be decoded or parsed before validation |
+| `not_found` | 404 | A path that matches no route |
+| `method_not_allowed` | 405 | A method the matched route does not support |
+| `internal_error` | 500 | An unexpected server failure |
 
 For `validation_error`, `details` lists one `{"loc", "msg", "type"}` entry per problem. Submitted values are never echoed back.
 
