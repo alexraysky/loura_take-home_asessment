@@ -311,18 +311,16 @@ _PREVENTIVE = (
     "risk of",
     "what (?:happens|would happen)",
 )
-# A bare conditional is hypothetical only in a question ("What if I can't log in?", "When an
-# export fails, how do I configure retries?"). In a statement it frames a fact: "Even if I reset my
-# password I can't log in.", "Whether I use Chrome or Firefox the export fails.", "Not sure if
-# anyone noticed the API is down." An interrogative "When will the API be back?" or "Since when
-# has the export failed?" asks about a real problem, so that "when" is not a cue.
+# A bare conditional ("in case", "in the event", "if" but not "even if", "whether", "suppose") is
+# hypothetical only in a question: "What if I can't log in?", "In case the export fails, what
+# should I do?". In a statement it frames a fact: "Even if I reset my password I can't log in.",
+# "Whether I use Chrome or Firefox the export fails.", "Not sure if anyone noticed the API is down."
 _CONDITIONAL = (
     "in case",
     "in the event",
     "(?<!even )if",
     "whether",
     "suppose",
-    r"(?<!since )when(?:ever)?(?! (?:will|is|are|was|were|did|do|does|can|could|should|would|has|have)\b)",
 )
 _PREVENTIVE_RE = _cues(*_PREVENTIVE)
 _HYPOTHETICAL_RE = _cues(*_PREVENTIVE, *_CONDITIONAL)
