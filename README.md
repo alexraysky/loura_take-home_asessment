@@ -62,7 +62,7 @@ The id makes the request idempotent:
 | Existing id, identical `subject` and `body` | `200 OK`, the stored ticket in its current state; nothing is written or requeued |
 | Existing id, different `subject` or `body` | `409 Conflict`, code `ticket_conflict`; the stored ticket is unchanged |
 | Invalid payload (malformed JSON, or JSON that fails the rules above) | `422`, code `validation_error` |
-| Body that is not valid UTF-8 | `400`, code `http_error` |
+| Body that cannot be decoded or parsed before validation (for example undecodable UTF-8/16/32 bytes, or JSON nested too deeply) | `400`, code `http_error` |
 
 An omitted `subject` and `"subject": ""` are the same payload. Comparison is exact, so a whitespace or line-ending difference is a conflict.
 

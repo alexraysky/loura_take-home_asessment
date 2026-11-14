@@ -305,6 +305,16 @@ def test_malformed_json_is_validation_error(client):
     assert assert_validation_error(response)[0]["type"] == "json_invalid"
 
 
+def test_undecodable_body_is_http_error(client, db):
+    response = client.post(
+        "/tickets", content=b'{"id": "t-1001", "body": "\xff"}', headers={"content-type": "application/json"}
+    )
+    assert response.status_code == 400
+    assert response.json()["error"]["code"] == "http_error"
+    assert "t-1001" not in response.text
+    assert row_count(db) == 0
+
+
 def test_non_object_json_is_validation_error(client):
     details = assert_validation_error(client.post("/tickets", json=["t-1001", "Hi"]))
     assert [(d["loc"], d["type"]) for d in details] == [(["body"], "model_attributes_type")]
