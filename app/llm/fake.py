@@ -114,13 +114,18 @@ _INJECTION_RE = _cues(
     r"(?:respond|reply|answer) (?:only )?with (?:only )?(?:the following|this json|json)",
     r"(?:output|return|print) (?:only|exactly) (?:the following|this json|json)",
 )
+# A sentence that puts its topic off to another ticket never scores.
 _DEFERRAL_RE = _cues(
     "separately",
-    "later",
     "another ticket",
     "different ticket",
     "second (?:question|topic|thing)",
     "unrelated",
+)
+# Low-urgency wording may sit on the only request in the ticket ("No rush, where can I download
+# my invoices?"), so a sentence carrying it is dropped only while some other sentence remains.
+_LOW_URGENCY_RE = _cues(
+    "later",
     "no rush",
     "not urgent",
     "lower priority",
@@ -226,27 +231,48 @@ _FEATURE_RE = _cues(
     "support for",
 )
 _DAYS = "monday|tuesday|wednesday|thursday|friday|saturday|sunday|tomorrow"
-_HIGH_RE = _cues(
-    "production",
+# Impact that makes a ticket high on its own.
+_INCIDENT_RE = _cues(
     "outage",
     "(?:is|are|site|service) down",
+    "production (?:is )?(?:outage|down|incident|failure|crash(?:es|ed)?|broken|issues?|errors?)",
     "data loss",
     "lost data",
     "deleted (?:all|our)",
-    "security",
-    "breach",
-    "leak(?:ed)?",
+    "security (?:breach|incident|issue|hole|flaw|problem)",
+    "breach(?:ed)?",
+    "(?:data|security|credentials?|passwords?) leak(?:ed|s)?",
+    "leaked",
     "hacked",
     "compromised",
     "vulnerability",
+    "unauthori[sz]ed access",
+    "unable to process (?:orders|payments)",
+    "losing (?:revenue|money|sales|orders)",
+    "lost (?:revenue|sales|orders)",
+    "revenue loss",
+)
+# Context words that are high only next to a problem: "How do I configure the API in
+# production?" is a how-to question, "30% of requests fail in production" is an incident.
+_SCALE_RE = _cues(
+    "production",
+    "prod",
+    "revenue",
     "all (?:our )?(?:users|customers)",
     "many users",
     "hundreds of",
     "thousands of",
     r"\d+ ?% of",
     "every (?:request|user|customer)",
-    "unable to process (?:orders|payments)",
-    "revenue",
+)
+_PROBLEM_RE = _cues(
+    "5[0-9][0-9]",
+    "timeouts?",
+    "timing out",
+    "down",
+    "slow",
+    "affected",
+    "impacted",
 )
 _BLOCKED_RE = _cues(
     "can'?t",
@@ -444,8 +470,9 @@ def classify_text(subject: str, body: str) -> dict[str, Any]:
     }
     # max() keeps the first of equal scores, so ties go technical > billing > account.
     best = max(scores, key=lambda name: scores[name])
-    high = bool(_HIGH_RE.search(whole))
     blocked = bool(_BLOCKED_RE.search(whole))
+    problem = blocked or bool(_PROBLEM_RE.search(whole))
+    high = bool(_INCIDENT_RE.search(whole)) or (problem and bool(_SCALE_RE.search(whole)))
     feature = bool(_FEATURE_RE.search(whole))
     if scores[best] == 0 or (feature and not (high or blocked)):
         category = "other"
@@ -506,13 +533,16 @@ def _scoring_text(text: str, injected: bool) -> str:
     joined = " ".join(sentences)
     patterns = (_DEFERRAL_RE, _INJECTION_RE) if injected else (_DEFERRAL_RE,)
     dropped = [m.span() for pattern in patterns for m in pattern.finditer(joined)]
-    kept, start = [], 0
+    low_urgency = [m.span() for m in _LOW_URGENCY_RE.finditer(joined)]
+    kept, all_but_dropped, start = [], [], 0
     for sentence in sentences:
         end = start + len(sentence)
         if not any(a < end and start < b for a, b in dropped):
-            kept.append(sentence)
+            all_but_dropped.append(sentence)
+            if not any(a < end and start < b for a, b in low_urgency):
+                kept.append(sentence)
         start = end + 1
-    return " ".join(kept)
+    return " ".join(kept or all_but_dropped)
 
 
 def _is_injected(subject: str, body: str) -> bool:
