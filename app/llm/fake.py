@@ -332,6 +332,10 @@ _CONDITIONAL = (
 )
 _PREVENTIVE_RE = _cues(*_PREVENTIVE)
 _HYPOTHETICAL_RE = _cues(*_PREVENTIVE, *_CONDITIONAL)
+# Conditional cues in a how-to clause with no reason keep their question scope across a comma: "How
+# can I fix it if production goes down, will all users be locked out?" Preventive verbs are left
+# out, so "How can I avoid an outage; our API is down." still reports the outage.
+_CONDITIONAL_RE = _cues(*_CONDITIONAL, "what (?:happens|would happen)")
 # The cue counts only in the same clause, before the impact words: "We tried to prevent it, but
 # now the API is down." and "I tried to avoid it and now I am locked out." still report the problem.
 # In a question a hypothetical clause also covers the clauses after it up to an explicit contrast:
@@ -525,6 +529,20 @@ _REASON_RE = _cues(
     rf" (?:(?:with|for|about|on)(?! (?:{_TASKS})\b)|fixing|resolving|debugging|investigating)",
     r"(?:refund(?:ed)?|reimburs(?:ed?|ement)|credit(?:ed)?) (?:for|on|after)",
 )
+# A clause after a comma that asserts something on its own ends the how-to question before it: "How
+# can I log in, I am locked out." It must not open with a subordinator, preposition or conjunction
+# and must hold a finite verb, so lists and subordinate clauses stay part of the question: "How do I
+# handle errors, timeouts, and crashes in production?", "How do I configure retries, when an export
+# fails?". Matched from the clause start with one lazy scan, so the cost stays linear in its length.
+_ASSERTED_CLAUSE_RE = re.compile(
+    r"\s*+(?!(?:if|when|whenever|while|where|unless|until|before|after|without|by|to|for|with|in|on"
+    r"|during|and|or|whether|suppose|even)(?!\w))"
+    r".*?\b(?:am|is|are|was|were|'m|'s|'re|have|has|had|'ve|can'?t|cannot|won'?t|don'?t|doesn'?t"
+    r"|didn'?t|keeps?|kept|gets?|got|see|saw|found|lost|tried|asked|wrote|needs?|owes?|went"
+    r"|returns?|returned|throws?|threw|fails?|failed|crash(?:es|ed)?|freezes?|froze|stopped|charged"
+    r"|billed|overcharged|locked|blocked)(?!\w)",
+    re.S,
+)
 # Negation right before an impact cue denies it: "There is no outage.", "We did not experience an
 # outage.", "There is no outage or data loss." It must end where the cue starts, so "Not sure if
 # anyone noticed the API is down." and "No, the API is down." still report the problem. Searched
@@ -549,6 +567,28 @@ _SIGN_OFF_RE = re.compile(
     r"[ !.,]*"
 )
 _INVOICE_RE = _cues("invoices?")
+# The download summary needs wording that asks for access to an invoice and none that asks to change
+# one: "Where can I find my invoice?" asks for access, "I need an invoice corrected." and "Please add
+# our VAT number to the invoice." ask for a change.
+_INVOICE_ACCESS_RE = _cues(
+    "download(?:s|ed|ing)?",
+    "where (?:can|do|is|are)",
+    "find",
+    "see",
+    "view",
+    "access",
+    "retrieve",
+    "obtain",
+)
+_INVOICE_CHANGE_RE = _cues(
+    "correct(?:ed|ing|ion)?",
+    "updat(?:e|ed|ing)",
+    "chang(?:e|ed|ing)",
+    "amend(?:ed|ing)?",
+    "fix(?:ed|ing)?",
+    "add(?:ed|ing)? (?:my|our|the|a|an|vat|tax|billing|company|address)",
+    "remov(?:e|ed|ing)",
+)
 _CATEGORY_CUES = {"technical": _TECHNICAL_RE, "billing": _BILLING_RE, "account": _ACCOUNT_RE}
 # Cues that make a sentence a request in its own right. Modifiers such as "again", "can't" or "how
 # do I" are left out: "Thanks again!" and "Can't wait to hear back." are sign-offs, not requests.
@@ -708,8 +748,9 @@ def classify_text(subject: str, body: str) -> dict[str, Any]:
     }
     # Equal scores go to the category of the sentences that report a blocker, so "I cannot change
     # my email address. How do I export data?" is about the account. max() keeps the first of
-    # equal keys, so remaining ties go technical > billing > account.
-    reported = " ".join(s for s in sentences if _reports_blocker(s))
+    # equal keys, so remaining ties go technical > billing > account. Only the reported part of
+    # those sentences counts: "How can I avoid an outage, I am locked out." is about the account.
+    reported = " ".join(_reported_part(s) for s in sentences if _reports_blocker(s))
     best = max(scores, key=lambda name: (scores[name], len(_CATEGORY_CUES[name].findall(reported))))
     blocked = any(map(_reports_blocker, sentences))
     high_sentences = [s for s in sentences if _reports_high_impact(s)]
@@ -817,7 +858,12 @@ def _summary_for(
         return "Customer is following up on an unresolved billing problem."
     if priority == "medium" and chasing:
         return f"Customer is following up on an unresolved {category} request."
-    if category == "billing" and _INVOICE_RE.search(whole):
+    if (
+        category == "billing"
+        and _INVOICE_RE.search(whole)
+        and _INVOICE_ACCESS_RE.search(whole)
+        and not _INVOICE_CHANGE_RE.search(whole)
+    ):
         return "Customer asks where to download invoices."
     if category == "other":
         if feature:
@@ -901,15 +947,37 @@ def _reported_part(sentence: str) -> str:
     # report too: "Can I get help because all users are locked out?", "Can I get help with my
     # account being locked out?" Clause separators and hypothetical cues between the opener and the
     # reason are kept, so "How can I avoid asking for help with an outage?" stays a question.
-    howto = _HOWTO_RE.search(sentence)
-    if howto is None:
-        return sentence
-    before = sentence[: howto.start()]
-    reason = _REASON_RE.search(sentence, howto.end())
-    if reason is None:
-        return before
-    qualifiers = " ".join(m.group() for m in _QUALIFIER_RE.finditer(sentence, howto.end(), reason.start()))
-    return " ".join(part for part in (before, qualifiers, sentence[reason.start() :]) if part)
+    # The question runs clause by clause up to a separator other than a comma, or a comma before an
+    # independently asserted clause, so "How can I fix this; our API is down." and "How can I log
+    # in, I am locked out." still report the problem. Separators are kept for _states.
+    pieces: list[str] = []
+    in_howto, clause_start = False, 0
+    for separator in (*_CLAUSE_SPLIT_RE.finditer(sentence), None):
+        clause = sentence[clause_start : separator.start() if separator else len(sentence)]
+        # in_howto survives only a comma, so an asserted clause here follows a comma.
+        if in_howto and _ASSERTED_CLAUSE_RE.match(clause):
+            in_howto = False
+        howto = _HOWTO_RE.search(clause)
+        if howto is None and not in_howto:
+            pieces.append(clause)
+        else:
+            before, start = ("", 0) if howto is None else (clause[: howto.start()], howto.end())
+            in_howto = True
+            reason = _REASON_RE.search(clause, start)
+            if reason is None:
+                cues = " ".join(m.group() for m in _CONDITIONAL_RE.finditer(clause, start))
+                pieces.append(" ".join(part for part in (before, cues) if part))
+            else:
+                in_howto = False
+                qualifiers = " ".join(m.group() for m in _QUALIFIER_RE.finditer(clause, start, reason.start()))
+                pieces.append(" ".join(part for part in (before, qualifiers, clause[reason.start() :]) if part))
+        if separator is None:
+            break
+        pieces.append(separator.group())
+        if separator.group() != ",":
+            in_howto = False
+        clause_start = separator.end()
+    return "".join(pieces)
 
 
 def _reports_incident(sentence: str) -> bool:

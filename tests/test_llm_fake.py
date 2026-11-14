@@ -1703,3 +1703,81 @@ def test_long_negated_or_help_request_bodies_classify_in_linear_time(body):
     start = time.monotonic()
     classify_text("", body)
     assert time.monotonic() - start < 0.5
+
+
+@pytest.mark.parametrize(
+    ("body", "category", "priority"),
+    [
+        ("How can I fix this; our API is down.", "technical", "high"),
+        ("How can I fix this: our API is down.", "technical", "high"),
+        ("How can I fix this, but our API is down.", "technical", "high"),
+        ("How can I avoid an outage; our API is down.", "technical", "high"),
+        ("How can I log in, I am locked out.", "account", "medium"),
+        ("How can I avoid an outage, I am locked out.", "account", "medium"),
+        ("How can I fix this, our API returns 503.", "technical", "medium"),
+        ("Where can I download my invoice; I was charged twice.", "billing", "medium"),
+    ],
+)
+def test_an_independent_problem_clause_after_a_how_to_opener_is_a_report(body, category, priority):
+    # A separator other than a comma, or a comma before a clause asserted on its own, ends the
+    # how-to question, so punctuation never hides a reported problem.
+    answer = classify_text("", body)
+    assert (answer["category"], answer["priority"]) == (category, priority)
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        "How do I handle errors, timeouts, and crashes in production?",
+        "How do I configure retries, when an export fails?",
+        "How do I export data; how do I handle errors in production?",
+        "How can I fix it if production goes down, will all users be locked out?",
+    ],
+)
+def test_lists_and_subordinate_clauses_after_a_how_to_opener_stay_questions(body):
+    answer = classify_text("", body)
+    assert (answer["category"], answer["priority"]) == ("technical", "low")
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        "How do I handle " + "errors, " * 2400 + "?",
+        "How can I log in" + ", I am locked out" * 1100,
+    ],
+)
+def test_long_comma_separated_how_to_bodies_classify_in_linear_time(body):
+    assert len(body) <= 20_000
+    start = time.monotonic()
+    classify_text("", body)
+    assert time.monotonic() - start < 0.5
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        TICKETS["t-1005"][1],
+        "Where can I download my invoices?",
+        "How can I see my invoice again?",
+        "Where can I find my invoice?",
+    ],
+)
+def test_invoice_access_questions_use_the_download_summary(body):
+    answer = classify_text("", body)
+    assert (answer["category"], answer["priority"]) == ("billing", "low")
+    assert answer["summary"] == "Customer asks where to download invoices."
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        "I need an invoice corrected.",
+        "Please add our VAT number to the invoice.",
+        "Can you update the billing address on our invoice?",
+        "Where can I get my invoice corrected?",
+    ],
+)
+def test_invoice_change_requests_use_the_neutral_billing_summary(body):
+    answer = classify_text("", body)
+    assert (answer["category"], answer["priority"]) == ("billing", "low")
+    assert answer["summary"] == "Customer asks a question about billing."
