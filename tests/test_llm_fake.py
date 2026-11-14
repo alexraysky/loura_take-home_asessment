@@ -1000,3 +1000,66 @@ def test_sign_offs_are_not_follow_ups(body):
 def test_real_follow_ups_stay_medium(body, category):
     answer = classify_text("", body)
     assert (answer["category"], answer["priority"]) == (category, "medium")
+
+
+@pytest.mark.parametrize(
+    ("subject", "body", "category", "priority"),
+    [
+        ("API", "No rush, our API is down and all users are blocked.", "technical", "high"),
+        ("API outage", "Not urgent for us, but production is down for all users.", "technical", "high"),
+        ("Login", "Not urgent, but I can't log in to my account.", "account", "medium"),
+        ("Invoice", "No rush, but I was charged twice this month.", "billing", "medium"),
+        ("Export", "This can wait, but the export fails with a 500 error.", "technical", "medium"),
+    ],
+)
+def test_low_urgency_wording_keeps_reported_impact(subject, body, category, priority):
+    answer = classify_text(subject, body)
+    assert (answer["category"], answer["priority"]) == (category, priority)
+
+
+@pytest.mark.parametrize(
+    ("subject", "body", "category"),
+    [
+        ("API", "API issue. Whenever you have time, also check billing.", "technical"),
+        ("API", "No rush, where are the webhook docs?", "technical"),
+        ("Where can I download my invoices?", "No rush, how do I change my email address?", "billing"),
+    ],
+)
+def test_low_urgency_asides_without_impact_still_drop_behind_a_subject_request(subject, body, category):
+    answer = classify_text(subject, body)
+    assert (answer["category"], answer["priority"]) == (category, "low")
+
+
+@pytest.mark.parametrize(
+    ("body", "category"),
+    [
+        ("How do I download my invoice? I have asked twice and still have no response.", "billing"),
+        ("Following up again: how do I download my invoice?", "billing"),
+        ("Still no response, how do I download my invoice?", "billing"),
+        ("Any update? How can I reset my password?", "account"),
+        ("How do I download my invoice? This is the third time I am asking.", "billing"),
+    ],
+)
+def test_unresolved_follow_ups_outrank_how_to_questions(body, category):
+    answer = classify_text("", body)
+    assert (answer["category"], answer["priority"]) == (category, "medium")
+
+
+def test_how_to_follow_up_on_billing_uses_the_follow_up_summary():
+    answer = classify_text("", "How do I download my invoice? I have asked twice and still have no response.")
+    assert answer["summary"] == "Customer is following up on an unresolved billing problem."
+
+
+@pytest.mark.parametrize(
+    ("body", "category"),
+    [
+        ("How can I see my invoice again?", "billing"),
+        ("Can I still downgrade?", "billing"),
+        ("How do I follow up on a refund request?", "billing"),
+        ("How do I change my email address? I still love the product.", "account"),
+        ("Where can I download my invoices again? Is the old one still available?", "billing"),
+    ],
+)
+def test_still_and_again_in_how_to_questions_stay_low(body, category):
+    answer = classify_text("", body)
+    assert (answer["category"], answer["priority"]) == (category, "low")

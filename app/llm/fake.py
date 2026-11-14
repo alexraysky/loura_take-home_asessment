@@ -397,6 +397,19 @@ _REPEAT_RE = _cues(
     "days ago",
     "haven'?t heard",
 )
+# Repeat cues that report an unresolved follow-up on their own. Bare "still" and "again" are left
+# out: "How can I see my invoice again?", "Can I still downgrade?" and "I still love the product"
+# are not follow-ups, so a how-to ticket is raised only by these.
+_FOLLOW_UP_RE = _cues(
+    "any update",
+    "no (?:reply|response|answer)",
+    "third time",
+    "second time",
+    "follow(?:ing)? ?up",
+    "haven'?t heard",
+    "asked (?:twice|again|before|already)",
+    "still (?:no|not|waiting|missing|unresolved|broken|failing|unable|can'?t|cannot|have(?:n'?t| not| no))",
+)
 _HOWTO_RE = _cues(
     "how (?:do|can|should|would) (?:i|we)",
     "how to",
@@ -579,11 +592,12 @@ def classify_text(subject: str, body: str) -> dict[str, Any]:
     money_owed = bool(_MONEY_OWED_RE.search(whole))
     deadline = bool(_DEADLINE_RE.search(whole))
     degraded = any(map(_reports_degradation, sentences))
+    followed_up = any(map(_reports_follow_up, sentences))
     if high:
         priority = "high"
     elif category == "other":
         priority = "low"
-    elif _HOWTO_RE.search(whole) and not (blocked or money_owed or deadline or degraded):
+    elif _HOWTO_RE.search(whole) and not (blocked or money_owed or deadline or degraded or followed_up):
         priority = "low"
     elif money_owed or deadline or _REPEAT_RE.search(whole):
         priority = "medium"
@@ -643,12 +657,37 @@ def _is_wide_problem(sentence: str) -> bool:
     return bool(_BLOCKED_RE.search(sentence) or _PROBLEM_RE.search(reported))
 
 
-def _reports_degradation(sentence: str) -> bool:
+def _reported_part(sentence: str) -> str:
     # Only wording before a how-to question is a report: "The API returns 503. How can I fix it?"
     # and "Dashboard is slow, how can I fix this?" report a problem, "How do I reduce latency?"
     # asks about configuration.
     howto = _HOWTO_RE.search(sentence)
-    return bool(_DEGRADED_RE.search(sentence[: howto.start()] if howto else sentence))
+    return sentence[: howto.start()] if howto else sentence
+
+
+def _reports_degradation(sentence: str) -> bool:
+    return bool(_DEGRADED_RE.search(_reported_part(sentence)))
+
+
+def _reports_follow_up(sentence: str) -> bool:
+    # "I have asked twice and still have no response." is a follow-up, "How do I follow up on a
+    # refund?" is a how-to question.
+    return bool(_FOLLOW_UP_RE.search(_reported_part(sentence)))
+
+
+def _reports_impact(sentence: str) -> bool:
+    """Whether the sentence describes impact that sets priority, whatever its tone."""
+    return bool(
+        _INCIDENT_RE.search(sentence)
+        or _BLOCKED_RE.search(sentence)
+        or _MONEY_OWED_RE.search(sentence)
+        or _DEADLINE_RE.search(sentence)
+        or _is_wide_problem(sentence)
+        or _is_production_failure(sentence)
+        or _is_vulnerability_report(sentence)
+        or _reports_degradation(sentence)
+        or _reports_follow_up(sentence)
+    )
 
 
 def _is_vulnerability_report(sentence: str) -> bool:
@@ -665,7 +704,8 @@ def _scoring_sentences(text: str, injected: bool, request_elsewhere: bool = Fals
     """Normalised sentences of ``text`` that count towards cues.
 
     ``request_elsewhere`` says the subject already carries a request, so deferred topics and
-    low-urgency asides in the body are dropped even when nothing else in the body remains.
+    low-urgency asides in the body are dropped even when nothing else in the body remains. A
+    low-urgency sentence that reports impact is never an aside.
     """
     sentences = [s for s in map(_normalise, _SENTENCE_SPLIT_RE.split(text)) if s]
     # Phrases are matched on the whole normalised text, as _is_injected does, so a phrase broken
@@ -685,10 +725,16 @@ def _scoring_sentences(text: str, injected: bool, request_elsewhere: bool = Fals
         injection = marked(_INJECTION_RE)
         kept = [i for i in kept if not injection[i]]
     # A deferred topic or a low-urgency aside is dropped only while another request remains, here
-    # or in the subject, so a greeting or sign-off never stands in for the only request.
-    for pattern in (_DEFERRAL_RE, _LOW_URGENCY_RE):
-        deferred = marked(pattern)
-        rest = [i for i in kept if not deferred[i]]
+    # or in the subject, so a greeting or sign-off never stands in for the only request. Low-urgency
+    # wording is tone, not a topic: "No rush, our API is down and all users are blocked." reports
+    # impact and always scores, whereas a deferral moves its topic to another ticket whatever it says.
+    low_urgency = marked(_LOW_URGENCY_RE)
+    asides = (
+        marked(_DEFERRAL_RE),
+        [hit and not _reports_impact(sentence) for hit, sentence in zip(low_urgency, sentences, strict=True)],
+    )
+    for aside in asides:
+        rest = [i for i in kept if not aside[i]]
         if request_elsewhere or _has_request([sentences[i] for i in rest]):
             kept = rest
     return [sentences[i] for i in kept]
