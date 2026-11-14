@@ -343,6 +343,24 @@ _PAST_RE = _cues(
     r"in 20\d\d",
 )
 _ONGOING_RE = _cues("still", "now", "currently", "again", "ongoing", "since", "today")
+# A present-tense problem state is going on now, whatever past change caused it: "Our API is down
+# after last week's release.", "All users are locked out after last week's upgrade." The past
+# tense ("We had an outage", "Our API went down last month") stays historical.
+_ACTIVE_STATE_RE = _cues(
+    r"(?:is|are|'s|'re|has been|have been) (?:still |currently |completely |totally )?"
+    r"(?:down|broken|unavailable|failing|crashing|offline|locked out|blocked|degraded|compromised"
+    r"|returning|throwing|losing|unable|not working|affected|impacted)",
+    "returns?",
+    "throws?",
+    "fails?",
+    "crash(?:es)?",
+    "freezes?",
+    "cannot",
+    "can'?t",
+    "doesn'?t work",
+    "do not work",
+    "won'?t",
+)
 # A reported vulnerability is high, but "Is there a vulnerability I should know about?" and "How do
 # I report a vulnerability?" are questions; a question is high only when it names an exploit.
 _VULN_RE = _cues(
@@ -795,9 +813,14 @@ def _is_question(sentence: str) -> bool:
 def _reports_high_impact(sentence: str) -> bool:
     """Whether the sentence reports impact that makes a ticket high on its own."""
     # "We had a production outage last year; how do I get the SLA report?" and "We had an outage
-    # last year." mention a past incident; wording that says it is still going on keeps it a report.
+    # last year." mention a past incident; wording that says it is still going on, or a present-tense
+    # problem state ("Our API is down after last week's release."), keeps it a report.
     reported = _reported_part(sentence)
-    if _PAST_RE.search(reported) and not _ONGOING_RE.search(reported):
+    if (
+        _PAST_RE.search(reported)
+        and not _ONGOING_RE.search(reported)
+        and not _ACTIVE_STATE_RE.search(reported)
+    ):
         return False
     return (
         _reports_incident(sentence)
@@ -821,11 +844,13 @@ def _is_production_failure(sentence: str) -> bool:
 
 
 def _is_wide_problem(sentence: str) -> bool:
-    # Scale counts only in the sentence that reports the problem: "I cannot change my email. How do
-    # I export data for all users?" is one blocked user and a how-to question.
-    if not _states(_SCALE_RE, sentence, reported=True):
-        return False
-    return _reports_blocker(sentence) or _states(_PROBLEM_RE, sentence, reported=True)
+    # Scale counts only in the clause that reports the problem: "I cannot change my email. How do
+    # I export data for all users?" is one blocked user and a how-to question, and "All users can
+    # log in, but I cannot change my email address." puts the scale and the blocker in different
+    # clauses.
+    return _states(_BLOCKED_RE, sentence, reported=True, require=_SCALE_RE) or _states(
+        _PROBLEM_RE, sentence, reported=True, require=_SCALE_RE
+    )
 
 
 def _reported_part(sentence: str) -> str:

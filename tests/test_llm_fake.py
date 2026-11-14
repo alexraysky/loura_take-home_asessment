@@ -1013,6 +1013,18 @@ def test_scale_counts_only_in_the_sentence_that_reports_the_problem():
 
 
 @pytest.mark.parametrize(
+    ("body", "category"),
+    [
+        ("All users can log in, but I cannot change my email address.", "account"),
+        ("All users are fine, but my export fails.", "technical"),
+    ],
+)
+def test_scale_counts_only_in_the_clause_that_reports_the_problem(body, category):
+    answer = classify_text("", body)
+    assert (answer["category"], answer["priority"]) == (category, "medium")
+
+
+@pytest.mark.parametrize(
     "body",
     [
         "> Production is down and all users are blocked.",
@@ -1263,6 +1275,28 @@ def test_questions_about_money_owed_or_deadlines_stay_low(body):
 def test_an_ongoing_outage_before_a_question_stays_high():
     answer = classify_text("", "Our API has been down since last week, how do I fix it?")
     assert (answer["category"], answer["priority"]) == ("technical", "high")
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        "Our API is down after last week's release.",
+        "Our API is down after the deployment in 2026.",
+    ],
+)
+def test_a_current_outage_caused_by_a_past_change_stays_high(body):
+    answer = classify_text("", body)
+    assert (answer["category"], answer["priority"]) == ("technical", "high")
+
+
+def test_a_current_lockout_caused_by_a_past_upgrade_stays_high():
+    answer = classify_text("", "All users are locked out after last week's upgrade.")
+    assert answer["priority"] == "high"
+
+
+def test_a_past_outage_before_a_question_stays_low():
+    answer = classify_text("", "There was an outage in 2024. Where can I see the postmortem?")
+    assert answer["priority"] == "low"
 
 
 @pytest.mark.parametrize(
