@@ -72,7 +72,7 @@ class Database:
             conn.row_factory = sqlite3.Row
             # WAL: readers do not block the single writer. Persistent in the file, cheap to repeat.
             conn.execute("PRAGMA journal_mode = WAL")
-            # NORMAL is safe against corruption in WAL mode; only a power cut can lose the last commits.
+            # NORMAL is safe against corruption in WAL mode; only a power cut or OS crash can lose the last commits.
             conn.execute("PRAGMA synchronous = NORMAL")
             conn.execute("PRAGMA foreign_keys = ON")
         except BaseException:

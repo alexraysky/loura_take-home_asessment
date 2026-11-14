@@ -245,7 +245,7 @@ def test_claim_and_list_queries_use_the_indexes(db):
 
 def test_concurrent_writers_wait_for_the_lock(db):
     threads_count = 16
-    barrier = threading.Barrier(threads_count)
+    barrier = threading.Barrier(threads_count, timeout=10)
     errors: list[BaseException] = []
 
     def write(i: int) -> None:
@@ -262,7 +262,8 @@ def test_concurrent_writers_wait_for_the_lock(db):
     for thread in threads:
         thread.start()
     for thread in threads:
-        thread.join()
+        thread.join(timeout=30)
+        assert not thread.is_alive()
 
     assert errors == []
     with db.connection() as conn:

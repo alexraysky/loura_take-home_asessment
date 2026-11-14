@@ -90,7 +90,7 @@ def test_columns_match_table_and_dataclass(db):
 
 def test_concurrent_inserts_of_same_id_create_one_row(repository, db):
     threads_count = 16
-    barrier = threading.Barrier(threads_count)
+    barrier = threading.Barrier(threads_count, timeout=10)
     results: list[tuple[Ticket, bool]] = []
     errors: list[BaseException] = []
     lock = threading.Lock()
@@ -109,7 +109,8 @@ def test_concurrent_inserts_of_same_id_create_one_row(repository, db):
     for thread in threads:
         thread.start()
     for thread in threads:
-        thread.join()
+        thread.join(timeout=30)
+        assert not thread.is_alive()
 
     assert errors == []
     assert len(results) == threads_count
