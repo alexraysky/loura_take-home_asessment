@@ -14,6 +14,8 @@ from starlette.exceptions import HTTPException as StarletteHTTPException
 from app.api import ApiError, ErrorBody, ErrorEnvelope, router
 from app.clock import Clock, utc_now
 from app.config import Settings
+from app.db import Database
+from app.repository import Repository
 
 log = logging.getLogger("app")
 
@@ -26,11 +28,14 @@ def create_app(settings: Settings | None = None, *, clock: Clock = utc_now) -> F
     """Build the app. Settings default to the environment, so bad config fails at startup."""
     settings = Settings.from_env() if settings is None else settings
     _configure_logging()
+    db = Database(settings.db_path)
+    repository = Repository(db, clock)
 
     @asynccontextmanager
     async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         log.info("starting with %s", settings)
-        # #2: create the schema at settings.db_path
+        db.create_schema()
+        log.info("schema ready at %s", db.path)
         # #8: clear stale claims before workers start
         # #7: start settings.worker_count worker tasks when worker_count > 0
         yield
@@ -39,6 +44,8 @@ def create_app(settings: Settings | None = None, *, clock: Clock = utc_now) -> F
     app = FastAPI(title="Ticket classifier", lifespan=lifespan)
     app.state.settings = settings
     app.state.clock = clock
+    app.state.db = db
+    app.state.repository = repository
     install_error_handlers(app)
     app.include_router(router)
     return app

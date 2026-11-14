@@ -7,7 +7,9 @@ from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
 from app.config import Settings
+from app.db import Database
 from app.main import create_app
+from app.repository import Repository
 
 
 class FakeClock:
@@ -53,3 +55,16 @@ def app(settings: Settings, clock: FakeClock) -> FastAPI:
 def client(app: FastAPI) -> Iterator[TestClient]:
     with TestClient(app) as c:
         yield c
+
+
+@pytest.fixture
+def db(settings: Settings) -> Database:
+    """The database at settings.db_path with the schema in place."""
+    database = Database(settings.db_path)
+    database.create_schema()
+    return database
+
+
+@pytest.fixture
+def repository(db: Database, clock: FakeClock) -> Repository:
+    return Repository(db, clock)

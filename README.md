@@ -79,8 +79,9 @@ app/
   config.py       Settings read from environment variables
   clock.py        Injected UTC clock and the fixed timestamp format
   api.py          Routes, request/response schemas, error envelope
-  db.py           Connection factory and schema creation        (planned)
-  repository.py   All SQL lives here                            (planned)
+  models.py       Shared domain types: allowed values and the Ticket row
+  db.py           Connection factory and schema creation
+  repository.py   All SQL lives here
   worker.py       Claim, classify, retry loop                   (planned)
   classifier.py   One classification attempt                    (planned)
   prompt.py       System prompt, PROMPT_VERSION, ticket wrapping (planned)
