@@ -218,3 +218,12 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# SQLite database and WAL side files
+*.db
+*.db-wal
+*.db-shm
+*.db-journal
+
+# Local agent worktrees
+.claude/

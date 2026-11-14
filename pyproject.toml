@@ -1,0 +1,32 @@
+[project]
+name = "ticket-classifier"
+version = "0.1.0"
+description = "Support ticket classification service: FastAPI, SQLite-backed queue, asyncio workers, deterministic fake LLM"
+readme = "README.md"
+requires-python = ">=3.15"
+dependencies = [
+  "fastapi>=0.162",
+  "pydantic>=2.14",
+  "uvicorn",
+]
+
+[dependency-groups]
+dev = [
+  "pytest>=9.1",
+  "pytest-asyncio",
+  "httpx",
+  # Starlette's TestClient is built on httpx2 and warns when only httpx is installed.
+  "httpx2",
+]
+
+[tool.uv]
+required-version = ">=0.13"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
+asyncio_default_test_loop_scope = "function"
+filterwarnings = ["error"]
+xfail_strict = true
