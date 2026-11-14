@@ -11,7 +11,7 @@ from collections.abc import Iterator
 from contextlib import closing, contextmanager
 from pathlib import Path
 
-# RETURNING (used by the claim in #7 and the idempotent insert in #3) needs 3.35.
+# RETURNING (used by the idempotent insert in repository.py for #3 and the claim in #7) needs 3.35.
 MIN_SQLITE_VERSION = (3, 35, 0)
 # Writers wait this long for the file lock before failing with "database is locked".
 BUSY_TIMEOUT_S = 5.0
@@ -57,12 +57,13 @@ class Database:
     """Connection factory for one SQLite file."""
 
     def __init__(self, path: str) -> None:
-        if path == ":memory:":
+        self.path = Path(path)
+        # Check after normalising: Path("./:memory:") is ":memory:" too, and SQLite would open RAM.
+        if str(self.path) == ":memory:":
             raise ValueError(
                 "DB_PATH must be a file path: every operation opens its own connection, "
                 "so an in-memory database would be empty on each use"
             )
-        self.path = Path(path)
 
     def connect(self) -> sqlite3.Connection:
         """Open a configured connection. The caller must close it; prefer ``connection()``."""

@@ -1,3 +1,4 @@
+import os
 import sqlite3
 import threading
 from contextlib import closing
@@ -50,9 +51,18 @@ def test_default_relative_path_works_in_the_working_directory(tmp_path, monkeypa
     assert (tmp_path / "tickets.db").is_file()
 
 
-def test_in_memory_path_is_rejected():
+# All three normalise to ":memory:"; the backslash is only a separator on Windows.
+IN_MEMORY_PATHS = [
+    ":memory:",
+    "./:memory:",
+    pytest.param(".\\:memory:", marks=pytest.mark.skipif(os.name != "nt", reason="Windows path")),
+]
+
+
+@pytest.mark.parametrize("path", IN_MEMORY_PATHS)
+def test_in_memory_path_is_rejected(path):
     with pytest.raises(ValueError, match="DB_PATH"):
-        Database(":memory:")
+        Database(path)
 
 
 def test_connection_pragmas(db):
@@ -66,10 +76,15 @@ def test_connection_pragmas(db):
 
 
 def test_wal_mode_persists_and_is_set_per_connection(db):
-    # A plain connection sees the persistent journal mode but the default synchronous level.
+    # A plain connection sees the persistent journal mode; synchronous is per connection,
+    # so a connection set to FULL does not affect the level a fresh db.connection() gets.
     with closing(sqlite3.connect(db.path, autocommit=True)) as raw:
         assert raw.execute("PRAGMA journal_mode").fetchone()[0] == "wal"
+        raw.execute("PRAGMA synchronous = FULL")
         assert raw.execute("PRAGMA synchronous").fetchone()[0] == 2  # FULL
+        with db.connection() as conn:
+            assert conn.execute("PRAGMA synchronous").fetchone()[0] == 1  # NORMAL
+        assert raw.execute("PRAGMA synchronous").fetchone()[0] == 2
     with db.connection() as conn:
         assert conn.execute("PRAGMA synchronous").fetchone()[0] == 1
 
@@ -223,8 +238,9 @@ def test_claim_and_list_queries_use_the_indexes(db):
     with db.connection() as conn:
         claim_plan = conn.execute(f"EXPLAIN QUERY PLAN {claim}", {"lease_cutoff": NOW, "now": NOW}).fetchall()
         list_plan = conn.execute(f"EXPLAIN QUERY PLAN {listing}", (NOW, "t-1", 10)).fetchall()
-    assert any(row["detail"].startswith("SEARCH tickets USING INDEX idx_tickets_claim") for row in claim_plan)
-    assert any(row["detail"].startswith("SEARCH tickets USING INDEX idx_tickets_list") for row in list_plan)
+    # 3.35 says "SEARCH TABLE tickets USING INDEX ...", 3.36+ drops "TABLE"; match the index part only.
+    assert any("USING INDEX idx_tickets_claim" in row["detail"] for row in claim_plan)
+    assert any("USING INDEX idx_tickets_list" in row["detail"] for row in list_plan)
 
 
 def test_concurrent_writers_wait_for_the_lock(db):

@@ -1,4 +1,5 @@
 import logging
+import os
 import sqlite3
 from contextlib import closing
 from pathlib import Path
@@ -231,6 +232,14 @@ def test_repository_works_after_startup(client):
     assert repository.get_ticket("t-1001") == ticket
 
 
-def test_in_memory_db_path_fails_at_create_app():
+@pytest.mark.parametrize(
+    "db_path",
+    [
+        ":memory:",
+        "./:memory:",
+        pytest.param(".\\:memory:", marks=pytest.mark.skipif(os.name != "nt", reason="Windows path")),
+    ],
+)
+def test_in_memory_db_path_fails_at_create_app(db_path):
     with pytest.raises(ValueError, match="DB_PATH"):
-        create_app(Settings(worker_count=0, db_path=":memory:"))
+        create_app(Settings(worker_count=0, db_path=db_path))

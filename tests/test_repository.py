@@ -1,3 +1,4 @@
+import threading
 from dataclasses import fields
 
 from app.clock import format_ts
@@ -85,3 +86,35 @@ def test_columns_match_table_and_dataclass(db):
         table_columns = [row["name"] for row in conn.execute("PRAGMA table_info(tickets)")]
     listed = [name.strip() for name in _COLUMNS.split(",")]
     assert listed == table_columns == [f.name for f in fields(Ticket)]
+
+
+def test_concurrent_inserts_of_same_id_create_one_row(repository, db):
+    threads_count = 16
+    barrier = threading.Barrier(threads_count)
+    results: list[tuple[Ticket, bool]] = []
+    errors: list[BaseException] = []
+    lock = threading.Lock()
+
+    def insert(i: int) -> None:
+        try:
+            barrier.wait()
+            result = repository.insert_ticket("t-race", "Subject", f"body-{i}")
+            with lock:
+                results.append(result)
+        except BaseException as exc:
+            with lock:
+                errors.append(exc)
+
+    threads = [threading.Thread(target=insert, args=(i,)) for i in range(threads_count)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+
+    assert errors == []
+    assert len(results) == threads_count
+    assert sum(created for _, created in results) == 1
+    stored = repository.get_ticket("t-race")
+    assert all(ticket == stored for ticket, _ in results)
+    with db.connection() as conn:
+        assert conn.execute("SELECT COUNT(*) FROM tickets WHERE id = 't-race'").fetchone()[0] == 1

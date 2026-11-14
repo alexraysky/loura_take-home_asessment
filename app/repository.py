@@ -5,6 +5,7 @@ Timestamps are bound as ``format_ts`` strings, never as ``datetime`` objects
 """
 
 import sqlite3
+from contextlib import closing
 
 from app.clock import Clock, format_ts
 from app.db import Database
@@ -39,11 +40,16 @@ class Repository:
         """
         now = self._now()
         with self._db.connection() as conn:
-            row = conn.execute(
-                f"INSERT INTO tickets (id, subject, body, created_at, updated_at) "
-                f"VALUES (?, ?, ?, ?, ?) ON CONFLICT (id) DO NOTHING RETURNING {_COLUMNS}",
-                (id, subject, body, now, now),
-            ).fetchone()
+            # Close the RETURNING cursor explicitly so the statement is finished (and the
+            # autocommit transaction committed) before we decide anything from the result.
+            with closing(
+                conn.execute(
+                    f"INSERT INTO tickets (id, subject, body, created_at, updated_at) "
+                    f"VALUES (?, ?, ?, ?, ?) ON CONFLICT (id) DO NOTHING RETURNING {_COLUMNS}",
+                    (id, subject, body, now, now),
+                )
+            ) as cur:
+                row = cur.fetchone()
             if row is not None:
                 return ticket_from_row(row), True
             # Rows are never deleted and id/subject/body never change, so this cannot miss.
