@@ -73,6 +73,9 @@ HIJACKED_ANSWER: dict[str, Any] = {
     "flag_reason": None,
 }
 PROSE_PREFIX = "Sure! Here is the classification: "
+# Bounds on what a long-lived FakeLLM keeps in memory; see the FakeLLM docstring.
+MAX_RECORDED_CALLS = 1_000
+MAX_TRACKED_PROMPTS = 10_000
 FLAG_REASON_INJECTION = "Ticket text addresses the classifier."
 
 # Coupled with app/prompt.py: the boundary tag is ``ticket-`` plus alphanumerics of any length.
@@ -308,10 +311,19 @@ _PREVENTIVE = (
     "risk of",
     "what (?:happens|would happen)",
 )
-# A bare conditional is hypothetical only in a question ("What if I can't log in?"). In a
-# statement it frames a fact: "Even if I reset my password I can't log in.", "Whether I use
-# Chrome or Firefox the export fails.", "Not sure if anyone noticed the API is down."
-_CONDITIONAL = ("in case", "in the event", "(?<!even )if", "whether", "suppose")
+# A bare conditional is hypothetical only in a question ("What if I can't log in?", "When an
+# export fails, how do I configure retries?"). In a statement it frames a fact: "Even if I reset my
+# password I can't log in.", "Whether I use Chrome or Firefox the export fails.", "Not sure if
+# anyone noticed the API is down." An interrogative "When will the API be back?" or "Since when
+# has the export failed?" asks about a real problem, so that "when" is not a cue.
+_CONDITIONAL = (
+    "in case",
+    "in the event",
+    "(?<!even )if",
+    "whether",
+    "suppose",
+    r"(?<!since )when(?:ever)?(?! (?:will|is|are|was|were|did|do|does|can|could|should|would|has|have)\b)",
+)
 _PREVENTIVE_RE = _cues(*_PREVENTIVE)
 _HYPOTHETICAL_RE = _cues(*_PREVENTIVE, *_CONDITIONAL)
 # The cue counts only in the same clause, before the impact words: "We tried to prevent it, but
@@ -503,10 +515,14 @@ class FakeLLM:
     """Deterministic stand-in for a model; see the module docstring for how outcomes are chosen.
 
     ``script`` serves the listed modes in order, one per call, ignoring ticket content,
-    ``seed``, ``failure_rate`` and ``gullible``. Running past its end raises ``RuntimeError``;
-    that call has already taken its per-prompt call index but is not appended to ``calls``, so
-    ``calls`` lists only the calls the script served.
-    Call counters live in memory and grow by one entry per distinct prompt.
+    ``seed``, ``failure_rate`` and ``gullible``. Running past its end raises ``RuntimeError``
+    naming how many calls were served; that call has already taken its per-prompt call index but
+    is neither counted as served nor appended to ``calls``.
+
+    ``calls`` keeps only the most recent ``max_recorded_calls`` served calls (default 1,000; 0
+    disables retention), so a long-lived client does not hold every ticket it has seen. Per-prompt
+    call counters are capped at ``MAX_TRACKED_PROMPTS`` distinct prompts; past that the oldest
+    prompt's counter is dropped, and a later retry of that prompt starts again at call index 0.
     """
 
     def __init__(
@@ -516,6 +532,7 @@ class FakeLLM:
         failure_rate: float = 0.2,
         gullible: bool = True,
         script: Sequence[Mode] | None = None,
+        max_recorded_calls: int = MAX_RECORDED_CALLS,
     ) -> None:
         if isinstance(seed, bool) or not isinstance(seed, int):
             raise ValueError(f"seed must be an integer, got {seed!r}")
@@ -530,11 +547,19 @@ class FakeLLM:
                 raise ValueError("script must be a non-empty sequence of Mode members")
             if not all(isinstance(mode, Mode) for mode in script):
                 raise ValueError(f"script must contain only Mode members, got {list(script)!r}")
+        if not (
+            isinstance(max_recorded_calls, int)
+            and not isinstance(max_recorded_calls, bool)
+            and max_recorded_calls >= 0
+        ):
+            raise ValueError(f"max_recorded_calls must be a non-negative integer, got {max_recorded_calls!r}")
         self.seed = seed
         self.failure_rate = float(failure_rate)
         self.gullible = gullible
+        self.max_recorded_calls = max_recorded_calls
         self._script: deque[Mode] | None = None if script is None else deque(script)
         self._calls_by_key: dict[str, int] = {}
+        self._total_calls: int = 0
         self.calls: list[Call] = []
 
     @classmethod
@@ -548,19 +573,26 @@ class FakeLLM:
     async def complete(self, system: str, user: str) -> str:
         key = _prompt_key(system, user)
         n = self._calls_by_key.get(key, 0)
-        # Counted before the only await, so concurrent callers never share a counter value.
+        # Counted and evicted before the only await, so concurrent callers never share a counter
+        # value. Dicts keep insertion order, so the first key is the oldest prompt.
+        if key not in self._calls_by_key and len(self._calls_by_key) >= MAX_TRACKED_PROMPTS:
+            self._calls_by_key.pop(next(iter(self._calls_by_key)))
         self._calls_by_key[key] = n + 1
         # The fake does no I/O; yielding lets concurrent workers interleave here.
         await asyncio.sleep(0)
         mode = self._choose_mode(key, n, user)
-        self.calls.append(Call(system, user, mode))
+        self._total_calls += 1
+        if self.max_recorded_calls > 0:
+            if len(self.calls) >= self.max_recorded_calls:
+                del self.calls[0]
+            self.calls.append(Call(system, user, mode))
         log.debug("fake llm call %d for prompt %s: %s", n, key[:12], mode)
         return self._render(mode, key, n, user)
 
     def _choose_mode(self, key: str, n: int, user: str) -> Mode:
         if self._script is not None:
             if not self._script:
-                raise RuntimeError(f"FakeLLM script exhausted after {len(self.calls)} calls")
+                raise RuntimeError(f"FakeLLM script exhausted after {self._total_calls} calls")
             return self._script.popleft()
         if self.gullible and n == 0 and _is_injected(*_split_ticket(user)):
             return Mode.HIJACKED
@@ -733,19 +765,20 @@ def _reports_high_impact(sentence: str) -> bool:
 
 def _reports_blocker(sentence: str) -> bool:
     # "I am locked out." reports a blocker, "What happens if all users are locked out?" asks about one.
-    return _states(_BLOCKED_RE, sentence)
+    # "How do I handle errors in the API?" asks about errors; only wording before a how-to counts.
+    return _states(_BLOCKED_RE, sentence, reported=True)
 
 
 def _is_production_failure(sentence: str) -> bool:
-    if not (_PRODUCTION_RE.search(sentence) and _states(_FAILURE_RE, sentence)):
-        return False
-    return not _HOWTO_RE.search(sentence) or _reports_blocker(sentence)
+    # "Our production API returns 500 errors, how can I fix it?" reports a failure; "How do I
+    # handle errors in production?" asks about one.
+    return bool(_PRODUCTION_RE.search(_reported_part(sentence)) and _states(_FAILURE_RE, sentence, reported=True))
 
 
 def _is_wide_problem(sentence: str) -> bool:
     # Scale counts only in the sentence that reports the problem: "I cannot change my email. How do
     # I export data for all users?" is one blocked user and a how-to question.
-    if not _states(_SCALE_RE, sentence):
+    if not _states(_SCALE_RE, sentence, reported=True):
         return False
     return _reports_blocker(sentence) or _states(_PROBLEM_RE, sentence, reported=True)
 
@@ -839,6 +872,8 @@ def _reports_impact(sentence: str) -> bool:
 def _is_vulnerability_report(sentence: str) -> bool:
     # "We found a vulnerability in your API." is a report, "We want to prevent a security
     # vulnerability in the API." is not.
+    # A how-to question is already gated on exploit wording, so the whole sentence counts: "How do I
+    # report a vulnerability in your API that exposes other workspaces?" reports one.
     if not _states(_VULN_RE, sentence):
         return False
     return not _is_question(sentence) or bool(_EXPLOIT_RE.search(sentence))

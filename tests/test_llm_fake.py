@@ -5,6 +5,7 @@ import time
 
 import pytest
 
+import app.llm.fake as fake_mod
 from app.config import Settings
 from app.llm import FakeLLM, LLMClient, LLMError, LLMTimeout, LLMUnavailable, Mode
 from app.llm.fake import (
@@ -621,6 +622,46 @@ async def test_calls_records_returned_and_raised_calls():
     with pytest.raises(LLMUnavailable):
         await fake.complete("sys", "second")
     assert fake.calls == [Call("sys", "first", Mode.OK), Call("sys", "second", Mode.UNAVAILABLE)]
+
+
+async def test_calls_keeps_only_the_most_recent_but_counts_every_served_call():
+    fake = FakeLLM(script=[Mode.OK, Mode.TIMEOUT, Mode.UNAVAILABLE, Mode.OK], max_recorded_calls=2)
+    for user in ("a", "b", "c", "d"):
+        await outcome(fake, user)
+    assert fake.calls == [Call(SYSTEM, "c", Mode.UNAVAILABLE), Call(SYSTEM, "d", Mode.OK)]
+    with pytest.raises(RuntimeError, match="exhausted after 4 calls"):
+        await fake.complete(SYSTEM, "e")
+    assert [call.user for call in fake.calls] == ["c", "d"]
+
+
+async def test_zero_max_recorded_calls_records_nothing():
+    fake = honest(max_recorded_calls=0)
+    for i in range(3):
+        await fake.complete(SYSTEM, f"ticket {i}")
+    assert fake.calls == []
+
+
+def test_default_max_recorded_calls():
+    assert FakeLLM().max_recorded_calls == fake_mod.MAX_RECORDED_CALLS == 1_000
+
+
+@pytest.mark.parametrize("limit", [-1, True, False, 1.0, "10", None])
+def test_invalid_max_recorded_calls_is_rejected(limit):
+    with pytest.raises(ValueError, match="max_recorded_calls"):
+        FakeLLM(max_recorded_calls=limit)
+
+
+async def test_per_prompt_counters_are_bounded(monkeypatch):
+    monkeypatch.setattr(fake_mod, "MAX_TRACKED_PROMPTS", 3)
+    fake = honest()
+    for user in ("a", "b", "c"):
+        await fake.complete(SYSTEM, user)
+    await fake.complete(SYSTEM, "a")  # A known prompt evicts nothing.
+    assert len(fake._calls_by_key) == 3
+    await fake.complete(SYSTEM, "d")
+    assert len(fake._calls_by_key) == 3
+    assert fake_mod._prompt_key(SYSTEM, "a") not in fake._calls_by_key
+    assert fake._calls_by_key[fake_mod._prompt_key(SYSTEM, "d")] == 1
 
 
 # Heuristic
@@ -1264,3 +1305,20 @@ def test_long_hypothetical_bodies_stay_low_and_classify_in_linear_time(body):
     answer = classify_text("", body)
     assert time.monotonic() - start < 0.5
     assert answer["priority"] == "low"
+
+
+@pytest.mark.parametrize(
+    ("body", "priority"),
+    [
+        ("How do I handle errors in the API?", "low"),
+        ("How do I handle errors in production?", "low"),
+        ("How do I handle errors for all users?", "low"),
+        ("How do I configure retry handling when an export fails?", "low"),
+        ("When an export fails, how do I configure retry handling?", "low"),
+        ("Our API returns 503, how do I fix it?", "medium"),
+        ("How do I fix our API? It returns 503.", "medium"),
+    ],
+)
+def test_how_to_wording_is_not_a_reported_problem(body, priority):
+    answer = classify_text("", body)
+    assert (answer["category"], answer["priority"]) == ("technical", priority)
