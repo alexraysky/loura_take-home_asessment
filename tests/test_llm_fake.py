@@ -1227,6 +1227,46 @@ def test_hypothetical_scale_blockers_and_vulnerabilities_do_not_raise_priority(b
 
 
 @pytest.mark.parametrize(
+    ("body", "category", "summary"),
+    [
+        (
+            "What happens if production goes down, will all users be locked out?",
+            "technical",
+            "Customer asks a technical question with no time pressure.",
+        ),
+        (
+            "If production goes down, can I get help with the outage?",
+            "technical",
+            "Customer asks a technical question with no time pressure.",
+        ),
+        (
+            "If we are charged twice, how can I get a refund for the duplicate charge?",
+            "billing",
+            "Customer asks a question about billing.",
+        ),
+    ],
+)
+def test_a_hypothetical_clause_in_a_question_covers_the_clauses_after_it(body, category, summary):
+    answer = classify_text("", body)
+    assert (answer["category"], answer["priority"]) == (category, "low")
+    assert answer["summary"] == summary
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        "If we try to prevent it, yet the site is still down, what should we do?",
+        "What if we skipped the deploy, but production is still down?",
+        "If we avoid a deploy, yet our API is still down, what should we do?",
+    ],
+)
+def test_a_contrast_ends_hypothetical_scope_in_a_question(body):
+    answer = classify_text("", body)
+    assert (answer["category"], answer["priority"]) == ("technical", "high")
+    assert answer["summary"] == "Customer reports a production problem affecting many users."
+
+
+@pytest.mark.parametrize(
     ("body", "category", "priority"),
     [
         ("I am locked out.", "account", "medium"),

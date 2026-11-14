@@ -334,7 +334,10 @@ _PREVENTIVE_RE = _cues(*_PREVENTIVE)
 _HYPOTHETICAL_RE = _cues(*_PREVENTIVE, *_CONDITIONAL)
 # The cue counts only in the same clause, before the impact words: "We tried to prevent it, but
 # now the API is down." and "I tried to avoid it and now I am locked out." still report the problem.
+# In a question a hypothetical clause also covers the clauses after it up to an explicit contrast:
+# "If production goes down, will all users be locked out?" asks about both.
 _CLAUSE_SPLIT_RE = re.compile(r"[,;:]| but | yet | (?:and|so) (?:now|then|still) ")
+_SOFT_SEPARATORS = frozenset(",;:")
 # A past incident mentioned before a question is context, not a report: "We had an outage last
 # year; how do I get the SLA report?". Wording that says it is still going on keeps it a report.
 _PAST_RE = _cues(
@@ -888,6 +891,9 @@ def _states(
     A match right after a negation in its clause ("no outage") does not count. ``reported`` searches only the wording before a how-to question (see _reported_part). Bare
     conditionals count as cues only when the whole sentence is a question. ``require``, when given,
     must also match in the clause of the match: "Production is fine, but the staging export fails."
+    In a question a clause with a cue makes the clauses after it hypothetical too, up to a contrast
+    ("but", "yet", "and now"): "If production goes down, will all users be locked out?" asks, "If
+    we skip the deploy, but production is still down, what should we do?" reports.
 
     One pass over the matches and clause separators, each clause searched for a cue at most once,
     so a long body is never rescanned per match. Every impact cue starts on a word character after
@@ -896,22 +902,32 @@ def _states(
     separator, so no match spans two clauses.
     """
     text = _reported_part(sentence) if reported else sentence
-    cues = _HYPOTHETICAL_RE if _is_question(sentence) else _PREVENTIVE_RE
+    question = _is_question(sentence)
+    cues = _HYPOTHETICAL_RE if question else _PREVENTIVE_RE
     separators = _CLAUSE_SPLIT_RE.finditer(text)
     separator = next(separators, None)
-    clause_start, cue_end = 0, None
+    # has_cue is None until the current clause is searched; carried means an earlier clause of the
+    # question was hypothetical with no contrast since.
+    clause_start, cue_end, has_cue, carried = 0, None, None, False
     for m in pattern.finditer(text):
         while separator is not None and separator.end() <= m.start():
-            clause_start, cue_end = separator.end(), None
+            if question and separator.group() not in _SOFT_SEPARATORS:
+                carried = False
+            elif question and not carried:
+                if has_cue is None:
+                    has_cue = cues.search(text[clause_start : separator.start()]) is not None
+                carried = has_cue
+            clause_start, cue_end, has_cue = separator.end(), None, None
             separator = next(separators, None)
         if cue_end is None:
             clause_end = separator.start() if separator is not None else len(text)
             clause = text[clause_start:clause_end]
-            if require is not None and not require.search(clause):
+            if carried or (require is not None and not require.search(clause)):
                 # No match in this clause counts: every one starts at or after clause_start.
                 cue_end = clause_start
             else:
                 cue = cues.search(clause)
+                has_cue = cue is not None
                 cue_end = clause_start + cue.end() if cue else len(text) + 1
         if cue_end > m.start() and not _NEGATED_RE.search(
             text, max(clause_start, m.start() - _NEGATION_WINDOW), m.start()
