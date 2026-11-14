@@ -8,7 +8,7 @@ import pytest
 
 from app.db import BUSY_TIMEOUT_S, Database
 from app.models import CATEGORIES, PRIORITIES, STATUSES
-from app.repository import _COLUMNS
+from app.repository import _COLUMNS, _list_query
 
 NOW = "2026-11-14T12:00:00.000000Z"
 
@@ -225,7 +225,7 @@ def test_integrity_check_is_ok(db):
         assert conn.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
 
 
-def test_claim_and_list_queries_use_the_indexes(db):
+def test_claim_query_uses_the_index(db):
     claim = """
         SELECT id FROM tickets
         WHERE status = 'pending'
@@ -234,13 +234,29 @@ def test_claim_and_list_queries_use_the_indexes(db):
         ORDER BY created_at, id
         LIMIT 1
     """
-    listing = f"SELECT {_COLUMNS} FROM tickets WHERE (created_at, id) > (?, ?) ORDER BY created_at, id LIMIT ?"
     with db.connection() as conn:
         claim_plan = conn.execute(f"EXPLAIN QUERY PLAN {claim}", {"lease_cutoff": NOW, "now": NOW}).fetchall()
-        list_plan = conn.execute(f"EXPLAIN QUERY PLAN {listing}", (NOW, "t-1", 10)).fetchall()
     # 3.35 says "SEARCH TABLE tickets USING INDEX ...", 3.36+ drops "TABLE"; match the index part only.
     assert any("USING INDEX idx_tickets_claim" in row["detail"] for row in claim_plan)
-    assert any("USING INDEX idx_tickets_list" in row["detail"] for row in list_plan)
+
+
+@pytest.mark.parametrize("after", [None, (NOW, "t-1")], ids=["first-page", "cursor"])
+@pytest.mark.parametrize(
+    "filters",
+    [{}, {"category": "billing", "priority": "high", "flagged": True}],
+    ids=["no-filter", "all-filters"],
+)
+def test_list_query_uses_the_index(db, after, filters):
+    filters = {"category": None, "priority": None, "flagged": None, **filters}
+    sql, params = _list_query(after=after, limit=10, **filters)
+    with db.connection() as conn:
+        plan = [row["detail"] for row in conn.execute(f"EXPLAIN QUERY PLAN {sql}", params)]
+    # The index order is the result order: an ordered walk, never a sort.
+    assert not any("TEMP B-TREE" in detail for detail in plan)
+    assert any("USING INDEX idx_tickets_list" in detail for detail in plan)
+    if after is not None:
+        # The row-value comparison seeks into the index instead of scanning from the start.
+        assert any("USING INDEX idx_tickets_list ((created_at,id)>(?,?))" in detail for detail in plan)
 
 
 def test_concurrent_writers_wait_for_the_lock(db):
