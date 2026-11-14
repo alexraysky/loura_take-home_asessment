@@ -1282,11 +1282,35 @@ def test_suggestion_wording_does_not_hide_a_reported_problem(body, category, pri
     assert answer["summary"] == summary
 
 
-@pytest.mark.parametrize("body", ["Would love a dark mode!", "Feature request: please add dark mode."])
+@pytest.mark.parametrize(
+    "body",
+    [
+        "Would love a dark mode!",
+        "Feature request: please add dark mode.",
+        "Please add dark mode.",
+        "Could you add the ability to filter reports?",
+    ],
+)
 def test_real_feature_requests_stay_other_low(body):
     answer = classify_text("", body)
     assert (answer["category"], answer["priority"]) == ("other", "low")
     assert answer["summary"] == "Customer suggests a new feature."
+
+
+@pytest.mark.parametrize(
+    ("subject", "body", "category"),
+    [
+        ("", "Please add our VAT number to the invoice.", "billing"),
+        ("Account seat", "Can you add another seat to my account?", "account"),
+        ("", "Could you add my new email address to my account?", "account"),
+    ],
+)
+def test_add_requests_for_billing_or_account_details_are_not_feature_requests(subject, body, category):
+    answer = classify_text(subject, body)
+    assert (answer["category"], answer["priority"]) == (category, "low")
+    assert answer["summary"] != "Customer suggests a new feature."
+    if category == "account":
+        assert answer["summary"] == "Customer asks how to change an account setting."
 
 
 @pytest.mark.parametrize(

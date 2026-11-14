@@ -250,6 +250,16 @@ _TECHNICAL_RE = _cues(
     "freez(?:es|ing)",
     "glitch",
 )
+# "Add" asks for a feature only when it names product functionality: "Please add dark mode." and
+# "Could you add CSV export?" do, "Please add our VAT number to the invoice." and "Can you add
+# another seat to my account?" are billing and account requests.
+_FEATURE_ADD = (
+    r"add (?:a |an |the |some |more )?(?:[\w-]+ )?"
+    r"(?:options?|ability to|capabilit(?:y|ies)|modes?|themes?|shortcuts?|widgets?|integrations?"
+    r"|webhooks?|endpoints?|apis?|filters?|filtering|sorting|exports?|imports?|reports?|charts?"
+    r"|graphs?|dashboards?|notifications?|alerts?|support for)"
+    r"(?! to (?:my|our|the) (?:account|team|workspace|profile|invoice|receipt|billing|plan|subscription)\b)"
+)
 _FEATURE_RE = _cues(
     "feature request",
     "feature",
@@ -258,9 +268,7 @@ _FEATURE_RE = _cues(
     r"would love(?! (?:some |your |any )?(?:help|assistance|support|guidance|advice|to hear))",
     "suggestion",
     "suggest",
-    "please add",
-    "could you add",
-    "can you add",
+    _FEATURE_ADD,
     "it would help if",
     "wish",
     "idea",
