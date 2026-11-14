@@ -477,14 +477,33 @@ _HOWTO_RE = _cues(
     "could (?:i|we)",
     "what is the (?:best )?way",
 )
-# A causal clause after a how-to opener states why the customer asks. Temporal "since" ("since last
-# year", "since v2") only dates the question.
+# A causal clause after a how-to opener states why the customer asks, and a request for help with a
+# problem or a refund for a charge names the problem: "Could I get help with our API returning 500
+# errors?", "How can I get a refund for being charged twice?". Temporal "since" ("since last year",
+# "since v2") only dates the question, and help with a task ("help with handling errors") is a
+# how-to question.
 _MONTHS = "january|february|march|april|may|june|july|august|september|october|november|december"
-_CAUSE_RE = _cues(
+_TASKS = "handling|configuring|setting up|using|exporting|importing|migrating|testing|monitoring|logging|tracking"
+_REASON_RE = _cues(
     "because",
     "now that",
     "given that",
     rf"since(?! (?:last|yesterday|today|{_DAYS}|{_MONTHS}|20\d\d|v\d|\d))",
+    r"(?:get|need|want|looking for|asking for) (?:some |your |any )?(?:help|assistance|support)"
+    rf" (?:(?:with|for|about|on)(?! (?:{_TASKS})\b)|fixing|resolving|debugging|investigating)",
+    r"(?:refund(?:ed)?|reimburs(?:ed?|ement)|credit(?:ed)?) (?:for|on|after)",
+)
+# Negation right before an impact cue denies it: "There is no outage.", "We did not experience an
+# outage.", "There is no outage or data loss." It must end where the cue starts, so "Not sure if
+# anyone noticed the API is down." and "No, the API is down." still report the problem. Searched
+# only in a bounded window before each match, so the check costs the same for any body length.
+_NEGATION_WINDOW = 60
+_NEGATED_RE = re.compile(
+    r"(?:\b(?:no|not|never|without|zero|neither|nor)|n't)"
+    r"(?: (?:be|been|being|have|had|has|having|see|seen|seeing|experience[sd]?|experiencing))?"
+    r"(?: (?:a|an|the|any|more|further|single|real|actual|confirmed|ongoing|active|reported|production|security))*"
+    r"(?: \w+(?: \w+)? (?:or|nor))?"
+    r" \Z"
 )
 # A whole sentence of closing courtesy ("Thanks again!", "Can't wait to hear back.") is not a
 # request, so its "again" or "can't" must not read as a follow-up or a blocker.
@@ -797,16 +816,17 @@ def _is_wide_problem(sentence: str) -> bool:
 def _reported_part(sentence: str) -> str:
     # Only wording before a how-to question is a report: "The API returns 503. How can I fix it?"
     # and "Dashboard is slow, how can I fix this?" report a problem, "How do I reduce latency?"
-    # asks about configuration. A causal clause after it gives the reason for asking and is a
-    # report too: "Can I get help because all users are locked out?"
+    # asks about configuration. A causal clause or a request for help with a problem after it is a
+    # report too: "Can I get help because all users are locked out?", "Can I get help with my
+    # account being locked out?"
     howto = _HOWTO_RE.search(sentence)
     if howto is None:
         return sentence
     before = sentence[: howto.start()]
-    cause = _CAUSE_RE.search(sentence, howto.end())
-    if cause is None:
+    reason = _REASON_RE.search(sentence, howto.end())
+    if reason is None:
         return before
-    return f"{before} {sentence[cause.start() :]}" if before else sentence[cause.start() :]
+    return f"{before} {sentence[reason.start() :]}" if before else sentence[reason.start() :]
 
 
 def _reports_incident(sentence: str) -> bool:
@@ -823,7 +843,7 @@ def _reports_incident(sentence: str) -> bool:
 def _states(pattern: re.Pattern[str], sentence: str, *, reported: bool = False) -> bool:
     """Whether ``pattern`` matches in ``sentence`` without a hypothetical cue before it in its clause.
 
-    ``reported`` searches only the wording before a how-to question (see _reported_part). Bare
+    A match right after a negation in its clause ("no outage") does not count. ``reported`` searches only the wording before a how-to question (see _reported_part). Bare
     conditionals count as cues only when the whole sentence is a question.
 
     One pass over the matches and clause separators, each clause searched for a cue at most once,
@@ -845,7 +865,9 @@ def _states(pattern: re.Pattern[str], sentence: str, *, reported: bool = False) 
             clause_end = separator.start() if separator is not None else len(text)
             cue = cues.search(text[clause_start:clause_end])
             cue_end = clause_start + cue.end() if cue else len(text) + 1
-        if cue_end > m.start():
+        if cue_end > m.start() and not _NEGATED_RE.search(
+            text, max(clause_start, m.start() - _NEGATION_WINDOW), m.start()
+        ):
             return True
     return False
 

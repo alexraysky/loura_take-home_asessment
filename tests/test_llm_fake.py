@@ -1379,3 +1379,77 @@ def test_a_billing_follow_up_without_a_blocker_keeps_the_follow_up_summary():
     answer = classify_text("", "Any update on my refund request?")
     assert (answer["category"], answer["priority"]) == ("billing", "medium")
     assert answer["summary"] == "Customer is following up on an unresolved billing problem."
+
+
+@pytest.mark.parametrize(
+    ("body", "category", "priority"),
+    [
+        ("Could I get help with our production API returning 500 errors?", "technical", "high"),
+        ("Can I get help with my account being locked out?", "account", "medium"),
+        ("How can I get a refund for being charged twice?", "billing", "medium"),
+        ("How can I get a refund if I am charged twice?", "billing", "low"),
+        ("Can I get help avoiding duplicate charges?", "billing", "low"),
+        ("Can I get help with error handling?", "technical", "low"),
+        ("Can I get help with an outage report?", "technical", "low"),
+        ("Can I get help with handling errors for all users?", "technical", "low"),
+        ("How do I follow up on a refund request?", "billing", "low"),
+    ],
+)
+def test_a_request_for_help_or_a_refund_after_a_how_to_opener_names_the_problem(body, category, priority):
+    answer = classify_text("", body)
+    assert (answer["category"], answer["priority"]) == (category, priority)
+
+
+def test_a_refund_for_a_double_charge_uses_the_double_charge_summary():
+    answer = classify_text("", "How can I get a refund for being charged twice?")
+    assert answer["summary"] == "Customer was charged twice and requests a refund of one charge."
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        "There is no outage. I just need the API documentation.",
+        "There is no production outage.",
+        "We had no data loss.",
+        "There wasn't an outage.",
+        "We did not experience an outage.",
+        "There is no outage or data loss.",
+    ],
+)
+def test_negated_incidents_are_not_high(body):
+    answer = classify_text("", body)
+    assert (answer["category"], answer["priority"]) == ("technical", "low")
+
+
+@pytest.mark.parametrize(
+    ("body", "category", "priority"),
+    [
+        ("Not sure if anyone noticed the API is down.", "technical", "high"),
+        ("No, the API is down.", "technical", "high"),
+        ("I did not deploy and now there is an outage.", "technical", "high"),
+        ("There is no outage, but exports are timing out.", "technical", "medium"),
+        ("My payment is not working.", "technical", "medium"),
+        ("I cannot log in.", "account", "medium"),
+        ("No, I cannot log in.", "account", "medium"),
+        ("Export doesn't work.", "technical", "medium"),
+    ],
+)
+def test_negation_counts_only_right_before_the_impact(body, category, priority):
+    answer = classify_text("", body)
+    assert (answer["category"], answer["priority"]) == (category, priority)
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        "There is " + "no outage " * 1990,
+        "We did " + "not see an error " * 1150,
+        "Can I get help with " + "help with " * 1900 + "?",
+        "How can I get a refund for " + "refund for " * 1700 + "?",
+    ],
+)
+def test_long_negated_or_help_request_bodies_classify_in_linear_time(body):
+    assert len(body) <= 20_000
+    start = time.monotonic()
+    classify_text("", body)
+    assert time.monotonic() - start < 0.5
