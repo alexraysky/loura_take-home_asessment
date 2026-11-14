@@ -66,6 +66,46 @@ The id makes the request idempotent:
 
 An omitted `subject` and `"subject": ""` are the same payload. Comparison is exact, so a whitespace or line-ending difference is a conflict.
 
+### `GET /tickets/{id}`
+
+```sh
+curl -i http://127.0.0.1:8000/tickets/t-1001
+```
+
+`200` with the ticket in its current state, or `404` with code `ticket_not_found`. Any id that is not stored is 404, including ids that `POST /tickets` would reject. This route takes no query parameters: any query parameter (`/tickets/t-1001?x=1`) is `422`, code `validation_error`, type `extra_forbidden`.
+
+### `GET /tickets`
+
+```sh
+curl -s 'http://127.0.0.1:8000/tickets?category=billing&limit=2'
+```
+
+| Parameter | Rules |
+|---|---|
+| `category` | One of `billing`, `technical`, `account`, `other` |
+| `priority` | One of `low`, `medium`, `high` |
+| `flagged` | `true` or `false`, exactly (`1`, `yes` or `True` are rejected) |
+| `limit` | 1 to 100, default 20 |
+| `cursor` | `next_cursor` from a previous response, passed back unchanged |
+
+An invalid value is `422`, code `validation_error`; a cursor the service did not produce is `400`, code `invalid_cursor`. Unlike `GET /tickets/{id}`, this route keeps the framework defaults for the query string: unknown parameters are ignored, and a repeated parameter takes its last value (`?limit=50&limit=2` means `limit=2`).
+
+Filters combine with AND. Tickets that are still `pending` (or `failed` before classification) have no category or priority, so a category or priority filter excludes them; `flagged=false` does include them.
+
+Tickets are ordered by `created_at` ascending, then `id`, so new tickets land at the end and paging is not disturbed by them. `next_cursor` is `null` on the last page:
+
+```json
+{
+  "items": [
+    {"id": "t-1001", "status": "classified", "category": "billing", "priority": "high", "...": "..."},
+    {"id": "t-1003", "status": "classified", "category": "billing", "priority": "low", "...": "..."}
+  ],
+  "next_cursor": "MjAyNi0xMS0xNFQxMjowMDowMC4wMDAwMDBafHQtMTAwMw"
+}
+```
+
+The cursor is the position of the last item returned (`created_at` and `id`), not a reference to a ticket: it is accepted after the filters or `limit` change, or if no ticket has that position. A sequence of pages is not a snapshot; a ticket whose labels change while you page can appear on a later page or drop out of a filter.
+
 ### Ticket representation
 
 ```json
@@ -97,9 +137,18 @@ Every error uses one envelope:
 {"error": {"code": "ticket_conflict", "message": "Ticket t-1001 already exists with different content.", "details": null}}
 ```
 
+| Code | Status | When |
+|---|---|---|
+| `validation_error` | 422 | The request body or query parameters fail validation |
+| `ticket_conflict` | 409 | `POST /tickets` with an existing id and different content |
+| `ticket_not_found` | 404 | `GET /tickets/{id}` with an id that is not stored |
+| `invalid_cursor` | 400 | `GET /tickets` with a cursor the service did not produce |
+
 For `validation_error`, `details` lists one `{"loc", "msg", "type"}` entry per problem. Submitted values are never echoed back.
 
-Read endpoints arrive with #9 and the sample loader with #10.
+`invalid_cursor` covers anything that is not exactly a `next_cursor` the service produced: wrong alphabet, padding, length or content.
+
+The sample loader arrives with #10.
 
 ## Configuration
 

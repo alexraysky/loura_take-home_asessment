@@ -1,15 +1,20 @@
 """Routes and request/response schemas.
 
 Holds the shared error contract, the ticket schemas used by every ticket
-endpoint, ``POST /tickets`` and the operational health probe.
+endpoint, ``POST /tickets``, the read endpoints (``GET /tickets/{id}``,
+``GET /tickets`` with its cursor codec) and the operational health probe.
 """
 
 import asyncio
-from typing import Annotated, Any
+import base64
+import re
+from typing import Annotated, Any, Literal
 
-from fastapi import APIRouter, Depends, Request, Response
+from fastapi import APIRouter, Depends, Query, Request, Response
+from fastapi.exceptions import RequestValidationError
 from pydantic import BaseModel, ConfigDict, Field
 
+from app.clock import parse_ts
 from app.models import Category, Priority, Status
 from app.repository import Repository
 
@@ -80,6 +85,80 @@ class TicketOut(BaseModel):
     updated_at: str
 
 
+class TicketPage(BaseModel):
+    """Body of ``GET /tickets``: one page in (created_at, id) order and the cursor for the next one."""
+
+    items: list[TicketOut]
+    next_cursor: str | None
+
+
+def _error_doc(description: str) -> dict[str, Any]:
+    return {"model": ErrorEnvelope, "description": description}
+
+
+# Declaring 422 also keeps FastAPI's own HTTPValidationError schema out of the OpenAPI document.
+GET_TICKET_RESPONSES: dict[int | str, dict[str, Any]] = {
+    404: _error_doc("No ticket with this id"),
+    422: _error_doc("Request validation failed"),
+}
+LIST_TICKETS_RESPONSES: dict[int | str, dict[str, Any]] = {
+    400: _error_doc("Cursor does not decode"),
+    422: _error_doc("Request validation failed"),
+}
+
+LIMIT_DEFAULT = 20
+LIMIT_MAX = 100
+
+# The base64url alphabet with no padding: exactly what encode_cursor emits.
+_CURSOR_RE = re.compile(r"[A-Za-z0-9_-]+")
+_ID_RE = re.compile(ID_PATTERN)
+_MAX_ID_LENGTH = 128
+# 27-character timestamp + "|" + 128-character id = 156 bytes -> 208 base64 characters.
+MAX_CURSOR_LENGTH = 208
+
+
+def encode_cursor(created_at: str, id: str) -> str:
+    """Opaque position of a ticket: unpadded base64url of ``"{created_at}|{id}"``."""
+    raw = f"{created_at}|{id}".encode("ascii")
+    return base64.urlsafe_b64encode(raw).decode("ascii").rstrip("=")
+
+
+def decode_cursor(cursor: str) -> tuple[str, str]:
+    """Inverse of ``encode_cursor``; anything it would not have produced is ``400 invalid_cursor``."""
+    # Checking the alphabet first also keeps "+" and "/" away from the decoder, which warns on them.
+    if not cursor or len(cursor) > MAX_CURSOR_LENGTH or not _CURSOR_RE.fullmatch(cursor):
+        raise _invalid_cursor()
+    try:
+        raw = base64.b64decode(cursor + "=" * (-len(cursor) % 4), altchars=b"-_", validate=True)
+        text = raw.decode("ascii")
+    except ValueError:  # binascii.Error (bad length) and UnicodeDecodeError are both ValueErrors
+        raise _invalid_cursor() from None
+    created_at, sep, id = text.partition("|")
+    if not sep or len(id) > _MAX_ID_LENGTH or not _ID_RE.fullmatch(id):
+        raise _invalid_cursor()
+    try:
+        parse_ts(created_at)
+    except ValueError:
+        raise _invalid_cursor() from None
+    if encode_cursor(created_at, id) != cursor:  # non-canonical trailing bits, e.g. "YR" for b"a"
+        raise _invalid_cursor()
+    return created_at, id
+
+
+def _invalid_cursor() -> ApiError:
+    return ApiError(400, "invalid_cursor", "Cursor is not valid; use next_cursor from a previous response.")
+
+
+def reject_query_params(request: Request) -> None:
+    """Dependency for routes that take no query parameters: any key is a 422 validation error."""
+    errors = [
+        {"loc": ("query", key), "msg": "Unknown query parameter.", "type": "extra_forbidden"}
+        for key in dict.fromkeys(key for key, _ in request.query_params.multi_items())
+    ]
+    if errors:
+        raise RequestValidationError(errors)
+
+
 def get_repository(request: Request) -> Repository:
     return request.app.state.repository
 
@@ -112,3 +191,42 @@ async def ingest_ticket(
         raise ApiError(409, "ticket_conflict", f"Ticket {ticket.id} already exists with different content.")
     response.status_code = 200
     return TicketOut.model_validate(ticket)
+
+
+@router.get(
+    "/tickets/{id}",
+    response_model=TicketOut,
+    responses=GET_TICKET_RESPONSES,
+    dependencies=[Depends(reject_query_params)],
+)
+async def get_ticket(id: str, repository: Annotated[Repository, Depends(get_repository)]) -> TicketOut:
+    """Return one ticket in its current state, or 404 ``ticket_not_found``."""
+    # No pattern check on the path: any id that is not stored is simply not found.
+    ticket = await asyncio.to_thread(repository.get_ticket, id)
+    if ticket is None:
+        raise ApiError(404, "ticket_not_found", "Ticket not found.")
+    return TicketOut.model_validate(ticket)
+
+
+@router.get("/tickets", response_model=TicketPage, responses=LIST_TICKETS_RESPONSES)
+async def list_tickets(
+    repository: Annotated[Repository, Depends(get_repository)],
+    category: Annotated[Category | None, Query()] = None,
+    priority: Annotated[Priority | None, Query()] = None,
+    flagged: Annotated[Literal["true", "false"] | None, Query()] = None,
+    limit: Annotated[int, Query(ge=1, le=LIMIT_MAX)] = LIMIT_DEFAULT,
+    cursor: Annotated[str | None, Query()] = None,
+) -> TicketPage:
+    """One page of tickets in (created_at, id) order; filters combine with AND."""
+    after = None if cursor is None else decode_cursor(cursor)
+    rows = await asyncio.to_thread(
+        repository.list_tickets,
+        category=category,
+        priority=priority,
+        flagged=None if flagged is None else flagged == "true",
+        after=after,
+        limit=limit + 1,  # one extra row tells us whether a next page exists
+    )
+    page = rows[:limit]
+    next_cursor = encode_cursor(page[-1].created_at, page[-1].id) if len(rows) > limit else None
+    return TicketPage(items=[TicketOut.model_validate(t) for t in page], next_cursor=next_cursor)
