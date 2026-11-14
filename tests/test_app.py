@@ -1,4 +1,7 @@
 import logging
+import sqlite3
+from contextlib import closing
+from pathlib import Path
 
 import pytest
 from fastapi import FastAPI, HTTPException
@@ -8,7 +11,9 @@ from pydantic import BaseModel, Field
 from app.api import ApiError
 from app.clock import utc_now
 from app.config import Settings
+from app.db import Database
 from app.main import create_app
+from app.repository import Repository
 
 
 class Item(BaseModel):
@@ -200,3 +205,32 @@ def test_lifespan_logs_effective_settings(settings, clock, caplog):
     with TestClient(create_app(settings, clock=clock)):
         pass
     assert any("starting with Settings(" in r.getMessage() for r in caplog.records)
+
+
+def test_lifespan_creates_schema(settings, clock):
+    app = create_app(settings, clock=clock)
+    assert not Path(settings.db_path).exists()
+    with TestClient(app):
+        with closing(sqlite3.connect(settings.db_path)) as conn:
+            names = {row[0] for row in conn.execute("SELECT name FROM sqlite_master")}
+            journal_mode = conn.execute("PRAGMA journal_mode").fetchone()[0]
+    assert {"tickets", "idx_tickets_claim", "idx_tickets_list"} <= names
+    assert journal_mode == "wal"
+
+
+def test_db_and_repository_are_on_app_state(app, settings):
+    assert isinstance(app.state.db, Database)
+    assert app.state.db.path == Path(settings.db_path)
+    assert isinstance(app.state.repository, Repository)
+
+
+def test_repository_works_after_startup(client):
+    repository = client.app.state.repository
+    ticket, created = repository.insert_ticket("t-1001", "Refund", "Please refund me.")
+    assert created is True
+    assert repository.get_ticket("t-1001") == ticket
+
+
+def test_in_memory_db_path_fails_at_create_app():
+    with pytest.raises(ValueError, match="DB_PATH"):
+        create_app(Settings(worker_count=0, db_path=":memory:"))
