@@ -1063,3 +1063,58 @@ def test_how_to_follow_up_on_billing_uses_the_follow_up_summary():
 def test_still_and_again_in_how_to_questions_stay_low(body, category):
     answer = classify_text("", body)
     assert (answer["category"], answer["priority"]) == (category, "low")
+
+
+@pytest.mark.parametrize(
+    ("body", "category"),
+    [
+        ("How do I avoid an outage in production?", "technical"),
+        ("How can I prevent data loss?", "technical"),
+        ("How do we handle a production outage in the config?", "technical"),
+        ("What happens if our site goes down?", "technical"),
+        ("What happens if production goes down?", "technical"),
+        ("We want to prevent an outage during the migration.", "technical"),
+    ],
+)
+def test_preventive_and_hypothetical_incident_questions_are_not_high(body, category):
+    answer = classify_text("", body)
+    assert (answer["category"], answer["priority"]) == (category, "low")
+    assert answer["summary"] == "Customer asks a technical question with no time pressure."
+
+
+def test_preventive_production_failure_question_is_not_high():
+    assert classify_text("", "How do I avoid production failing during a deploy?")["priority"] != "high"
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        "Our API is down and production crashed. How do we recover?",
+        "Our production API is down. What should we do?",
+        "Production is crashed! How do I check status?",
+        "Our API is down, how do I avoid data loss?",
+        "We tried to prevent it, but now the site is down.",
+    ],
+)
+def test_reported_incidents_followed_by_a_question_stay_high(body):
+    answer = classify_text("", body)
+    assert (answer["category"], answer["priority"]) == ("technical", "high")
+    assert answer["summary"] == "Customer reports a production problem affecting many users."
+
+
+def test_follow_up_without_a_repeat_word_raises_a_how_to_question():
+    answer = classify_text("", "How do I download my invoice? I have asked twice.")
+    assert (answer["category"], answer["priority"]) == ("billing", "medium")
+    assert answer["summary"] == "Customer is following up on an unresolved billing problem."
+
+
+def test_account_follow_up_uses_the_follow_up_summary():
+    answer = classify_text("", "Any update? How can I reset my password?")
+    assert (answer["category"], answer["priority"]) == ("account", "medium")
+    assert answer["summary"] == "Customer is following up on an unresolved account request."
+
+
+def test_repeat_word_in_a_how_to_question_does_not_use_the_follow_up_summary():
+    answer = classify_text("", "How can I see my invoice again?")
+    assert (answer["category"], answer["priority"]) == ("billing", "low")
+    assert answer["summary"] == "Customer asks where to download invoices."

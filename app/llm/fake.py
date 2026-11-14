@@ -229,6 +229,8 @@ _TECHNICAL_RE = _cues(
     "stopped working",
     "outage",
     _DOWN,
+    "data loss",
+    "lost data",
     "api",
     "endpoint",
     "webhooks?",
@@ -284,6 +286,25 @@ _INCIDENT_RE = _cues(
     "lost (?:revenue|sales|orders)",
     "revenue loss",
 )
+# Preventive or hypothetical wording turns incident words into a question about one: "How can I
+# prevent data loss?", "What happens if our site goes down?", "We want to avoid an outage."
+_HYPOTHETICAL_RE = _cues(
+    "avoid(?:s|ed|ing)?",
+    "prevent(?:s|ed|ing)?",
+    "(?:protect|guard) against",
+    "prepare for",
+    "plan for",
+    "in case",
+    "in the event",
+    "risk of",
+    "if",
+    "whether",
+    "suppose",
+    "what (?:happens|would happen)",
+)
+# The cue counts only in the same clause, before the incident words: "We tried to prevent it, but
+# now the API is down." still reports an outage.
+_CLAUSE_SPLIT_RE = re.compile(r"[,;:]| but ")
 # A reported vulnerability is high, but "Is there a vulnerability I should know about?" and "How do
 # I report a vulnerability?" are questions; a question is high only when it names an exploit.
 _VULN_RE = _cues(
@@ -578,7 +599,7 @@ def classify_text(subject: str, body: str) -> dict[str, Any]:
     best = max(scores, key=lambda name: (scores[name], len(_CATEGORY_CUES[name].findall(reported))))
     blocked = bool(_BLOCKED_RE.search(whole))
     high = (
-        bool(_INCIDENT_RE.search(whole))
+        any(map(_reports_incident, sentences))
         or any(map(_is_wide_problem, sentences))
         or any(map(_is_production_failure, sentences))
         or any(map(_is_vulnerability_report, sentences))
@@ -593,30 +614,38 @@ def classify_text(subject: str, body: str) -> dict[str, Any]:
     deadline = bool(_DEADLINE_RE.search(whole))
     degraded = any(map(_reports_degradation, sentences))
     followed_up = any(map(_reports_follow_up, sentences))
+    # Bare repeat wording ("still", "again") raises a ticket unless it only modifies a how-to
+    # question ("How can I see my invoice again?"); a reported follow-up raises it even then.
+    repeated = followed_up or bool(_REPEAT_RE.search(whole))
+    impaired = blocked or bool(_DEGRADED_RE.search(whole))
     if high:
         priority = "high"
     elif category == "other":
         priority = "low"
     elif _HOWTO_RE.search(whole) and not (blocked or money_owed or deadline or degraded or followed_up):
         priority = "low"
-    elif money_owed or deadline or _REPEAT_RE.search(whole):
+    elif money_owed or deadline or repeated:
         priority = "medium"
-    elif category in ("technical", "account") and (blocked or _DEGRADED_RE.search(whole)):
+    elif category in ("technical", "account") and impaired:
         priority = "medium"
     else:
         priority = "low"
 
+    chasing = repeated and not (impaired or money_owed or deadline)
     return {
         "category": category,
         "priority": priority,
-        "summary": _summary_for(category, priority, whole, feature, subject, body),
+        "summary": _summary_for(category, priority, whole, feature, chasing, subject, body),
         "flagged": injected,
         "flag_reason": FLAG_REASON_INJECTION if injected else None,
     }
 
 
-def _summary_for(category: str, priority: str, whole: str, feature: bool, subject: str, body: str) -> str:
+def _summary_for(
+    category: str, priority: str, whole: str, feature: bool, chasing: bool, subject: str, body: str
+) -> str:
     # Templates only, never ticket text, so a summary can not echo or obey the ticket.
+    # ``chasing`` says a follow-up is the only reason for a medium priority.
     if priority == "high":
         return _SUMMARIES[("technical", "high")] if category == "technical" else _SEVERE
     if category == "billing" and priority == "medium":
@@ -627,6 +656,8 @@ def _summary_for(category: str, priority: str, whole: str, feature: bool, subjec
         if _DEADLINE_RE.search(whole):
             return "Customer needs a billing matter resolved before a stated deadline."
         return "Customer is following up on an unresolved billing problem."
+    if priority == "medium" and chasing:
+        return f"Customer is following up on an unresolved {category} request."
     if category == "billing" and _INVOICE_RE.search(whole):
         return "Customer asks where to download invoices."
     if category == "other":
@@ -642,7 +673,7 @@ def _is_question(sentence: str) -> bool:
 
 
 def _is_production_failure(sentence: str) -> bool:
-    if not (_PRODUCTION_RE.search(sentence) and _FAILURE_RE.search(sentence)):
+    if not (_PRODUCTION_RE.search(sentence) and _states(_FAILURE_RE, sentence)):
         return False
     return not _HOWTO_RE.search(sentence) or bool(_BLOCKED_RE.search(sentence))
 
@@ -665,6 +696,20 @@ def _reported_part(sentence: str) -> str:
     return sentence[: howto.start()] if howto else sentence
 
 
+def _reports_incident(sentence: str) -> bool:
+    # "Our production API is down. What should we do?" reports an outage; "How do we handle a
+    # production outage?", "How do I avoid an outage?" and "What happens if our site goes down?" ask
+    # about one.
+    return _states(_INCIDENT_RE, _reported_part(sentence))
+
+
+def _states(pattern: re.Pattern[str], text: str) -> bool:
+    """Whether ``pattern`` matches in ``text`` without a hypothetical cue before it in its clause."""
+    return any(
+        not _HYPOTHETICAL_RE.search(_CLAUSE_SPLIT_RE.split(text[: m.start()])[-1]) for m in pattern.finditer(text)
+    )
+
+
 def _reports_degradation(sentence: str) -> bool:
     return bool(_DEGRADED_RE.search(_reported_part(sentence)))
 
@@ -678,7 +723,7 @@ def _reports_follow_up(sentence: str) -> bool:
 def _reports_impact(sentence: str) -> bool:
     """Whether the sentence describes impact that sets priority, whatever its tone."""
     return bool(
-        _INCIDENT_RE.search(sentence)
+        _reports_incident(sentence)
         or _BLOCKED_RE.search(sentence)
         or _MONEY_OWED_RE.search(sentence)
         or _DEADLINE_RE.search(sentence)
