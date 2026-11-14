@@ -3,7 +3,7 @@
 Each call picks a mode from a SHA-256 hash of the seed, the prompt and a
 per-prompt call counter, so runs are reproducible whatever the scheduling and
 a retry of the same prompt can get a different outcome. The prompt key drops
-the ``<ticket-NONCE>`` boundary tags that app/prompt.py adds with a random
+the outer ``<ticket-NONCE>`` boundary tags that app/prompt.py adds with a random
 nonce per request; without that every retry would look like a new prompt.
 
 ``Mode.HIJACKED`` is never sampled at random: a hijacked answer is
@@ -76,12 +76,13 @@ PROSE_PREFIX = "Sure! Here is the classification: "
 FLAG_REASON_INJECTION = "Ticket text addresses the classifier."
 
 # Coupled with app/prompt.py: the boundary tag is ``ticket-`` plus alphanumerics of any length.
-_NONCE_TAG_RE = re.compile(r"</?ticket-[A-Za-z0-9]+>")
-_SUBJECT_RE = re.compile(r"<subject>(.*?)</subject>", re.S)
-_BODY_RE = re.compile(r"<body>(.*?)</body>", re.S)
+# Only the outermost pair counts, closed with the same nonce; tags inside the ticket are text.
+_WRAPPER_RE = re.compile(r"\s*<ticket-([A-Za-z0-9]+)>(.*)</ticket-\1>\s*", re.S)
+_FIELDS_RE = re.compile(r"\s*<subject>(.*?)</subject>\s*<body>(.*)</body>\s*", re.S)
 _WS_RE = re.compile(r"\s+")
 _QUOTED_LINE_RE = re.compile(r"^[ \t]*>.*$", re.M)
-_SENTENCE_SPLIT_RE = re.compile(r"(?<=[.!?])\s+|\n+")
+# A single line break is a soft wrap, not a sentence end; a blank line is.
+_SENTENCE_SPLIT_RE = re.compile(r"(?<=[.!?])\s+|\n\s*\n")
 
 
 def _cues(*alternatives: str) -> re.Pattern[str]:
@@ -499,14 +500,18 @@ def _summary_for(category: str, priority: str, whole: str, feature: bool, subjec
 
 def _scoring_text(text: str, injected: bool) -> str:
     """Normalised sentences of ``text`` that count towards cues."""
-    kept = []
-    for sentence in _SENTENCE_SPLIT_RE.split(text):
-        sentence = _normalise(sentence)
-        if not sentence or _DEFERRAL_RE.search(sentence):
-            continue
-        if injected and _INJECTION_RE.search(sentence):
-            continue
-        kept.append(sentence)
+    sentences = [s for s in map(_normalise, _SENTENCE_SPLIT_RE.split(text)) if s]
+    # Deferrals and injections are matched on the whole normalised text, as _is_injected does,
+    # so a phrase broken across a sentence or paragraph boundary drops every sentence it touches.
+    joined = " ".join(sentences)
+    patterns = (_DEFERRAL_RE, _INJECTION_RE) if injected else (_DEFERRAL_RE,)
+    dropped = [m.span() for pattern in patterns for m in pattern.finditer(joined)]
+    kept, start = [], 0
+    for sentence in sentences:
+        end = start + len(sentence)
+        if not any(a < end and start < b for a, b in dropped):
+            kept.append(sentence)
+        start = end + 1
     return " ".join(kept)
 
 
@@ -514,13 +519,24 @@ def _is_injected(subject: str, body: str) -> bool:
     return any(_INJECTION_RE.search(_normalise(part)) for part in (subject, body))
 
 
+def _unwrap(user: str) -> str:
+    """The user message without its outer boundary tags, or unchanged if it has none."""
+    wrapper = _WRAPPER_RE.fullmatch(user)
+    return wrapper.group(2) if wrapper else user
+
+
 def _split_ticket(user: str) -> tuple[str, str]:
-    """(subject, body) from a wrapped user message, or ('', user) for raw text."""
-    text = _NONCE_TAG_RE.sub("", user)
-    subject, body = _SUBJECT_RE.search(text), _BODY_RE.search(text)
-    if subject is None and body is None:
+    """(subject, body) from a wrapped user message, or ('', text) when it has no field structure.
+
+    The ticket text may contain its own field tags, so the fields must span the whole message:
+    the body runs to the last ``</body>``. A stray tag can at worst move text from one field to
+    the other, never drop it, so _is_injected always sees every word of the ticket.
+    """
+    text = _unwrap(user)
+    fields = _FIELDS_RE.fullmatch(text)
+    if fields is None:
         return "", text
-    return (subject.group(1) if subject else "", body.group(1) if body else "")
+    return fields.group(1), fields.group(2)
 
 
 def _normalise(text: str) -> str:
@@ -528,11 +544,11 @@ def _normalise(text: str) -> str:
 
 
 def _prompt_key(system: str, user: str) -> str:
-    """Stable identity of a prompt: the system prompt plus the user message without the boundary nonce."""
+    """Stable identity of a prompt: the system prompt plus the user message without the boundary tags."""
     h = hashlib.sha256()
     h.update(system.encode("utf-8"))
     h.update(b"\x00")
-    h.update(_NONCE_TAG_RE.sub("", user).encode("utf-8"))
+    h.update(_unwrap(user).encode("utf-8"))
     return h.hexdigest()
 
 
