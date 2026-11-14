@@ -338,6 +338,9 @@ _HYPOTHETICAL_RE = _cues(*_PREVENTIVE, *_CONDITIONAL)
 # "If production goes down, will all users be locked out?" asks about both.
 _CLAUSE_SPLIT_RE = re.compile(r"[,;:]| but | yet | (?:and|so) (?:now|then|still) ")
 _SOFT_SEPARATORS = frozenset(",;:")
+# Clause separators and hypothetical cues between a how-to opener and its reason, kept in order so
+# "How can I avoid asking for help with an outage?" still asks about the outage.
+_QUALIFIER_RE = re.compile(f"{_CLAUSE_SPLIT_RE.pattern}|{_HYPOTHETICAL_RE.pattern}")
 # A past incident mentioned before a question is context, not a report: "We had an outage last
 # year; how do I get the SLA report?". Wording that says it is still going on keeps it a report.
 _PAST_RE = _cues(
@@ -551,7 +554,6 @@ _CATEGORY_CUES = {"technical": _TECHNICAL_RE, "billing": _BILLING_RE, "account":
 # do I" are left out: "Thanks again!" and "Can't wait to hear back." are sign-offs, not requests.
 _REQUEST_CUES = (*_CATEGORY_CUES.values(), _FEATURE_RE, _INCIDENT_RE, _VULN_RE)
 
-_SEVERE = "Customer reports a severe problem affecting many users."
 _SUMMARIES = {
     ("billing", "medium"): (
         "Customer reports a billing problem that is costing them money and asks for it to be corrected."
@@ -559,7 +561,6 @@ _SUMMARIES = {
     ("billing", "low"): "Customer asks a question about billing.",
     ("account", "medium"): "Customer cannot access their account and needs it restored.",
     ("account", "low"): "Customer asks how to change an account setting.",
-    ("technical", "high"): "Customer reports a production problem affecting many users.",
     ("technical", "medium"): "Customer reports an error that blocks their work.",
     ("technical", "low"): "Customer asks a technical question with no time pressure.",
     ("other", "low"): "Customer sent a message that does not fit a specific category.",
@@ -711,7 +712,11 @@ def classify_text(subject: str, body: str) -> dict[str, Any]:
     reported = " ".join(s for s in sentences if _reports_blocker(s))
     best = max(scores, key=lambda name: (scores[name], len(_CATEGORY_CUES[name].findall(reported))))
     blocked = any(map(_reports_blocker, sentences))
-    high = any(map(_reports_high_impact, sentences))
+    high_sentences = [s for s in sentences if _reports_high_impact(s)]
+    high = bool(high_sentences)
+    # The summary names production or scale only when a high-impact sentence reports it.
+    production = any(map(_reports_production_impact, high_sentences))
+    wide = any(map(_reports_wide_impact, high_sentences))
     # "How can I avoid being charged twice?" and "Is there a deadline to upgrade?" state neither.
     double_charged = any(_states(_DOUBLE_CHARGE_RE, s, reported=True) for s in sentences)
     money_owed = any(map(_reports_money_owed, sentences))
@@ -752,6 +757,8 @@ def classify_text(subject: str, body: str) -> dict[str, Any]:
         whole,
         subject,
         body,
+        production=production,
+        wide=wide,
         double_charged=double_charged,
         money_owed=money_owed,
         deadline=deadline,
@@ -775,6 +782,8 @@ def _summary_for(
     subject: str,
     body: str,
     *,
+    production: bool,
+    wide: bool,
     double_charged: bool,
     money_owed: bool,
     deadline: bool,
@@ -784,9 +793,18 @@ def _summary_for(
 ) -> str:
     # Templates only, never ticket text, so a summary can not echo or obey the ticket. The flags
     # are the ones that set the priority, so a summary never states what the ticket only asks about.
-    # ``chasing`` says a follow-up is the only reason for a medium priority.
+    # ``chasing`` says a follow-up is the only reason for a medium priority; ``production`` and
+    # ``wide`` say a high-impact sentence reports a production problem or many users affected.
     if priority == "high":
-        return _SUMMARIES[("technical", "high")] if category == "technical" else _SEVERE
+        if production and wide:
+            return "Customer reports a production problem affecting many users."
+        if production:
+            return "Customer reports a severe production problem."
+        if wide:
+            return "Customer reports a severe problem affecting many users."
+        if category in _CATEGORY_CUES:
+            return f"Customer reports a severe {category} problem."
+        return "Customer reports a severe problem."
     if category == "billing" and priority == "medium":
         if double_charged:
             return "Customer was charged twice and requests a refund of one charge."
@@ -856,12 +874,33 @@ def _is_wide_problem(sentence: str) -> bool:
     )
 
 
+def _reports_production_impact(sentence: str) -> bool:
+    # "Our production API is down." and "We have a vulnerability in prod." report a production
+    # problem; "Production is fine, but we have a data leak." does not.
+    return (
+        _is_production_failure(sentence)
+        or _states(_INCIDENT_RE, sentence, reported=True, require=_PRODUCTION_RE)
+        or (_is_vulnerability_report(sentence) and _states(_VULN_RE, sentence, require=_PRODUCTION_RE))
+    )
+
+
+def _reports_wide_impact(sentence: str) -> bool:
+    # "All users are locked out." reports many users affected; "All users can log in, but we found a
+    # security vulnerability in your API." does not.
+    return (
+        _is_wide_problem(sentence)
+        or _states(_INCIDENT_RE, sentence, reported=True, require=_SCALE_RE)
+        or (_is_vulnerability_report(sentence) and _states(_VULN_RE, sentence, require=_SCALE_RE))
+    )
+
+
 def _reported_part(sentence: str) -> str:
     # Only wording before a how-to question is a report: "The API returns 503. How can I fix it?"
     # and "Dashboard is slow, how can I fix this?" report a problem, "How do I reduce latency?"
     # asks about configuration. A causal clause or a request for help with a problem after it is a
     # report too: "Can I get help because all users are locked out?", "Can I get help with my
-    # account being locked out?"
+    # account being locked out?" Clause separators and hypothetical cues between the opener and the
+    # reason are kept, so "How can I avoid asking for help with an outage?" stays a question.
     howto = _HOWTO_RE.search(sentence)
     if howto is None:
         return sentence
@@ -869,7 +908,8 @@ def _reported_part(sentence: str) -> str:
     reason = _REASON_RE.search(sentence, howto.end())
     if reason is None:
         return before
-    return f"{before} {sentence[reason.start() :]}" if before else sentence[reason.start() :]
+    qualifiers = " ".join(m.group() for m in _QUALIFIER_RE.finditer(sentence, howto.end(), reason.start()))
+    return " ".join(part for part in (before, qualifiers, sentence[reason.start() :]) if part)
 
 
 def _reports_incident(sentence: str) -> bool:

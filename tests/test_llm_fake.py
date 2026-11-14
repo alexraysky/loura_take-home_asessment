@@ -1170,19 +1170,22 @@ def test_preventive_production_failure_question_is_not_high():
 
 
 @pytest.mark.parametrize(
-    "body",
+    ("body", "summary"),
     [
-        "Our API is down and production crashed. How do we recover?",
-        "Our production API is down. What should we do?",
-        "Production is crashed! How do I check status?",
-        "Our API is down, how do I avoid data loss?",
-        "We tried to prevent it, but now the site is down.",
+        (
+            "Our API is down and production crashed. How do we recover?",
+            "Customer reports a severe production problem.",
+        ),
+        ("Our production API is down. What should we do?", "Customer reports a severe production problem."),
+        ("Production is crashed! How do I check status?", "Customer reports a severe production problem."),
+        ("Our API is down, how do I avoid data loss?", "Customer reports a severe technical problem."),
+        ("We tried to prevent it, but now the site is down.", "Customer reports a severe technical problem."),
     ],
 )
-def test_reported_incidents_followed_by_a_question_stay_high(body):
+def test_reported_incidents_followed_by_a_question_stay_high(body, summary):
     answer = classify_text("", body)
     assert (answer["category"], answer["priority"]) == ("technical", "high")
-    assert answer["summary"] == "Customer reports a production problem affecting many users."
+    assert answer["summary"] == summary
 
 
 def test_follow_up_without_a_repeat_word_raises_a_how_to_question():
@@ -1253,17 +1256,26 @@ def test_a_hypothetical_clause_in_a_question_covers_the_clauses_after_it(body, c
 
 
 @pytest.mark.parametrize(
-    "body",
+    ("body", "summary"),
     [
-        "If we try to prevent it, yet the site is still down, what should we do?",
-        "What if we skipped the deploy, but production is still down?",
-        "If we avoid a deploy, yet our API is still down, what should we do?",
+        (
+            "If we try to prevent it, yet the site is still down, what should we do?",
+            "Customer reports a severe technical problem.",
+        ),
+        (
+            "What if we skipped the deploy, but production is still down?",
+            "Customer reports a severe production problem.",
+        ),
+        (
+            "If we avoid a deploy, yet our API is still down, what should we do?",
+            "Customer reports a severe technical problem.",
+        ),
     ],
 )
-def test_a_contrast_ends_hypothetical_scope_in_a_question(body):
+def test_a_contrast_ends_hypothetical_scope_in_a_question(body, summary):
     answer = classify_text("", body)
     assert (answer["category"], answer["priority"]) == ("technical", "high")
-    assert answer["summary"] == "Customer reports a production problem affecting many users."
+    assert answer["summary"] == summary
 
 
 @pytest.mark.parametrize(
@@ -1530,6 +1542,119 @@ def test_a_refund_for_a_double_charge_uses_the_double_charge_summary():
 
 
 @pytest.mark.parametrize(
+    ("body", "category", "summary"),
+    [
+        (
+            "How can I avoid asking for help with an outage?",
+            "technical",
+            "Customer asks a technical question with no time pressure.",
+        ),
+        (
+            "How do I avoid needing a refund for a duplicate charge?",
+            "billing",
+            "Customer asks a question about billing.",
+        ),
+        (
+            "How can I prevent needing help because all users are locked out?",
+            "account",
+            "Customer asks how to change an account setting.",
+        ),
+        (
+            "How do I handle errors if I need help with an outage?",
+            "technical",
+            "Customer asks a technical question with no time pressure.",
+        ),
+        (
+            "How do I handle errors in production because my key expired?",
+            "technical",
+            "Customer asks a technical question with no time pressure.",
+        ),
+    ],
+)
+def test_qualifiers_between_a_how_to_opener_and_its_reason_are_kept(body, category, summary):
+    # A preventive or hypothetical cue before the reason makes the reason a question, and other
+    # wording between the opener and the reason ("in production") is not part of the report.
+    answer = classify_text("", body)
+    assert (answer["category"], answer["priority"]) == (category, "low")
+    assert answer["summary"] == summary
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        "Can I avoid a call, but get help because the API is down?",
+        "Can I, even if I try, get help because the API is down?",
+    ],
+)
+def test_a_contrast_or_even_if_before_the_reason_keeps_the_report(body):
+    answer = classify_text("", body)
+    assert (answer["category"], answer["priority"]) == ("technical", "high")
+    assert answer["summary"] == "Customer reports a severe technical problem."
+
+
+def test_a_reason_after_a_how_to_opener_still_reports_wide_impact():
+    answer = classify_text("", "Can I get help because all users are locked out?")
+    assert (answer["category"], answer["priority"]) == ("account", "high")
+    assert answer["summary"] == "Customer reports a severe problem affecting many users."
+
+
+@pytest.mark.parametrize(
+    ("subject", "body", "category", "summary"),
+    [
+        (*TICKETS["t-1003"][:2], "technical", "Customer reports a production problem affecting many users."),
+        (
+            "",
+            "Our production API is down and all users are locked out.",
+            "technical",
+            "Customer reports a production problem affecting many users.",
+        ),
+        ("", "Our production API is down.", "technical", "Customer reports a severe production problem."),
+        ("", "We have a vulnerability in prod.", "other", "Customer reports a severe production problem."),
+        ("", "All users are locked out.", "account", "Customer reports a severe problem affecting many users."),
+        (
+            "",
+            "Our API is down for all users.",
+            "technical",
+            "Customer reports a severe problem affecting many users.",
+        ),
+        (
+            "",
+            "We found a security breach on our account.",
+            "account",
+            "Customer reports a severe account problem.",
+        ),
+        (
+            "",
+            "Someone has unauthorized access to our admin account.",
+            "account",
+            "Customer reports a severe account problem.",
+        ),
+        (
+            "",
+            "We found a security vulnerability in your API.",
+            "technical",
+            "Customer reports a severe technical problem.",
+        ),
+        ("", "We have a data leak.", "other", "Customer reports a severe problem."),
+        ("", "Production is fine, but we have a data leak.", "other", "Customer reports a severe problem."),
+        (
+            "",
+            "All users can log in, but we found a security vulnerability in your API.",
+            "technical",
+            "Customer reports a severe technical problem.",
+        ),
+    ],
+)
+def test_high_priority_summaries_name_only_the_reported_impact(subject, body, category, summary):
+    # Production and scale are named only when a high-impact clause reports them.
+    answer = classify_text(subject, body)
+    assert (answer["category"], answer["priority"]) == (category, "high")
+    assert answer["summary"] == summary
+    assert len(summary) <= 200 and "\n" not in summary
+    assert summary.count(".") == 1 and summary.endswith(".")
+
+
+@pytest.mark.parametrize(
     "body",
     [
         "There is no outage. I just need the API documentation.",
@@ -1570,6 +1695,7 @@ def test_negation_counts_only_right_before_the_impact(body, category, priority):
         "We did " + "not see an error " * 1150,
         "Can I get help with " + "help with " * 1900 + "?",
         "How can I get a refund for " + "refund for " * 1700 + "?",
+        "How can I " + "avoid, but if " * 1400 + "get help because the API is down?",
     ],
 )
 def test_long_negated_or_help_request_bodies_classify_in_linear_time(body):
