@@ -2,6 +2,7 @@
 
 import logging
 from contextlib import closing
+from dataclasses import replace
 from datetime import timedelta
 
 import pytest
@@ -343,7 +344,7 @@ def test_requeued_outdated_ticket_is_classified_again_by_the_worker(worker_setti
         first = wait_for_status(client, "t-1001", "classified")
         assert (first["attempts"], first["prompt_version"]) == (1, PROMPT_VERSION)
         set_state(app.state.db, "t-1001", prompt_version="v0")
-        clock.advance(1)  # the new claim gets a new token
+        clock.advance(1)  # the requeue comes after the first finish
         assert reclassify(client, "outdated_prompt") == 1
         body = wait_for_status(client, "t-1001", "classified")
         assert reclassify(client, "outdated_prompt") == 0
@@ -373,8 +374,10 @@ def test_requeued_failed_ticket_is_classified_again_by_the_worker(worker_setting
 
 
 def test_in_flight_ticket_is_not_reset_under_the_worker(worker_settings, clock):
+    # Timeouts far beyond the test's run: the parked call never times out or loses its lease.
+    settings = replace(worker_settings, llm_timeout_s=60.0, lease_timeout_s=120.0)
     gate = GateLLM()
-    app = create_app(worker_settings, clock=clock, llm=gate)
+    app = create_app(settings, clock=clock, llm=gate)
     with TestClient(app) as client:
         client.post("/tickets", json=T1001)
         wait_until(lambda: gate.parked == 1, "the model call")
@@ -390,15 +393,22 @@ def test_in_flight_ticket_is_not_reset_under_the_worker(worker_settings, clock):
                 "VALUES ('t-failed', 's', 'b', 'failed', 3, 'llm_timeout', ?, ?)",
                 (now, now),
             )
+        planted = repository.get_ticket("t-failed")
+        assert (planted.status, planted.attempts, planted.last_error) == ("failed", 3, "llm_timeout")
         clock.advance(1)
         assert reclassify(client, *SELECTORS) == 1
         assert repository.get_ticket("t-1001") == in_flight
-        # The requeued row goes to the idle worker, fresh: attempts 1, a new claim.
+        # The requeued row goes to the idle worker, fresh: attempts 1, no error, a claim of its own.
+        # Its claim timestamp is not compared with the clock: the polling worker may have read the
+        # clock before it moved.
         wait_until(lambda: gate.parked == 2, "the requeued ticket's model call")
         requeued = repository.get_ticket("t-failed")
         assert (requeued.status, requeued.attempts, requeued.last_error) == ("pending", 1, None)
-        assert requeued.claimed_at == format_ts(clock()) != in_flight.claimed_at
-        assert repository.get_ticket("t-1001") == in_flight
+        assert requeued.claimed_at is not None
+        after = repository.get_ticket("t-1001")
+        assert (after.status, after.attempts, after.claimed_at) == ("pending", 1, in_flight.claimed_at)
+        assert after == in_flight
+    assert gate.parked == 2
 
 
 def test_requeue_converges_with_the_pool(worker_settings, clock):

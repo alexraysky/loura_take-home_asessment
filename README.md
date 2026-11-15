@@ -139,7 +139,7 @@ The cursor is the position of the last item returned (`created_at` and `id`), no
 ### `POST /tickets/reclassify`
 
 ```sh
-curl -i -X POST http://127.0.0.1:8000/tickets/reclassify   -H 'content-type: application/json'   -d '{"select": ["failed", "outdated_prompt"]}'
+curl -i -X POST http://127.0.0.1:8000/tickets/reclassify \n  -H 'content-type: application/json' \n  -d '{"select": ["failed", "outdated_prompt"]}'
 ```
 
 Puts finished tickets back in the queue, for example after a prompt change or once the model is reachable again. `select` is a required list of one or both selectors, none repeated:
@@ -254,7 +254,7 @@ Known limits:
 - Shutdown is cancel-and-go: in-flight model calls are abandoned, with no grace period.
 - The claim sorts the pending rows (the index covers the `status` filter, not the order), so each claim costs O(pending). Fine for thousands of rows, not millions.
 - An idle pool picks up a new or requeued ticket within `POLL_INTERVAL_S`; ingest and reclassify do not wake the workers. Each idle claim is a tiny write.
-- The claim token is the claim's microsecond timestamp. It is unique per claim because a ticket can only be claimed again after its lease expires or after a restart, and `LEASE_TIMEOUT_S` must exceed `LLM_TIMEOUT_S`.
+- The claim token is the claim's microsecond timestamp. A ticket can only be claimed again after its lease expires, after a restart, or after a requeue by `POST /tickets/reclassify`. The token stays unique per claim because the clock moves between those events: `LEASE_TIMEOUT_S` must exceed `LLM_TIMEOUT_S`, and a requeue only resets a finished ticket, so the clock moves between the finish, the requeue and the next claim.
 - The startup claim reset assumes a single process: a second instance on the same database would wipe the first one's live claims at its start, so its results would be dropped as `stale` and the tickets classified again. Running two instances would need lease expiry only.
 - SQLite has one writer at a time: claims, results and ingest serialise, so throughput is bounded by statement latency, not by `WORKER_COUNT`.
 - A deterministic client bug costs `MAX_ATTEMPTS` model calls per ticket before it fails.
