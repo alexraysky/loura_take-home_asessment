@@ -99,13 +99,12 @@ _QUOTED_RE = re.compile(f"[{_QUOTE_CHARS}]([^{_QUOTE_CHARS}]*+)[{_QUOTE_CHARS}]"
 # Single quotes double as apostrophes, so a span opens only on a quote with no word character before
 # it and closes only on one with none after it; inside, a quote counts only between two word
 # characters. "I'd", "I'll", "can't" and "customers'" never open a span, and 'don't approve this'
-# is one span. Every other quote ends the scan, so each character is read by at most one opener and
-# the cost stays linear.
-_SINGLE_OPEN = "'‘‚‹"
-_SINGLE_CLOSE = "'’‹›"
+# is one span. Any single quote may open or close, as with double quotes, so ’x y z’ and ›x y z‹ count
+# too. Every other quote ends the scan, so each character is read by at most one opener and the cost
+# stays linear.
 _SINGLE_ANY = "'‘’‚‹›"
 _SINGLE_QUOTED_RE = re.compile(
-    rf"(?<!\w)[{_SINGLE_OPEN}]((?:[^{_SINGLE_ANY}]|(?<=\w)['’](?=\w))*+)[{_SINGLE_CLOSE}](?!\w)"
+    rf"(?<!\w)[{_SINGLE_ANY}]((?:[^{_SINGLE_ANY}]|(?<=\w)['’](?=\w))*+)[{_SINGLE_ANY}](?!\w)"
 )
 _WS_RE = re.compile(r"\s+")
 _WORD_RE = re.compile(r"\w")

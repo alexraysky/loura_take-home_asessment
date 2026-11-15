@@ -38,6 +38,7 @@ class Reply:
     content_type: str = "application/json"
     delay_s: float = 0.0
     drop: bool = False
+    headers: tuple[tuple[str, str], ...] = ()
 
 
 @dataclass
@@ -72,6 +73,20 @@ class ScriptedHandler(BaseHTTPRequestHandler):
             payload = body
         self.send_response(reply.status)
         self.send_header("Content-Type", reply.content_type)
+        self.send_header("Content-Length", str(len(payload)))
+        for name, value in reply.headers:
+            self.send_header(name, value)
+        self.end_headers()
+        self.wfile.write(payload)
+
+    def do_GET(self) -> None:
+        # The target of a redirect: it answers as if the ticket were stored, so following one would pass.
+        self.server.script.received.append(
+            Received("GET", self.path, {k.lower(): v for k, v in self.headers.items()}, b"")
+        )
+        payload = json.dumps({"id": "t-1", "subject": "", "body": "a", "status": "classified"}).encode()
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(payload)))
         self.end_headers()
         self.wfile.write(payload)
@@ -172,6 +187,14 @@ def test_help_exits_zero(capsys):
         "http://h:99999",
         "http://[::1",
         "",
+        "http://127.0.0.1:8766/é",
+        "http://" + "a" * 70 + ".com",
+        "http://a..b",
+        "http://h/a b",
+        " http://h",
+        "http://h\n",
+        "http://h/\x1b[2J",
+        "http://h/\u200b",
     ],
 )
 def test_bad_base_url_exits_2(capsys, server, url):
@@ -179,7 +202,34 @@ def test_bad_base_url_exits_2(capsys, server, url):
     assert code == 2
     assert out == ""
     assert "--base-url" in err
+    assert "Traceback" not in err
     assert server.received == []
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "http://user:secret@h",
+        "http://:secret@h",
+        "ftp://user:secret@h",
+        "file://user:secret@h/x",
+        "http://user:secret@h:bad",
+        "http://user:secret@h:99999",
+        "http://user:secret@/x",
+        "http://user:secret@h/?q=1",
+        "http://user:secret@[::1",
+    ],
+)
+def test_credentials_are_never_echoed(capsys, server, url):
+    code, out, err = run_seed(capsys, "--base-url", url)
+    assert (code, out) == (2, "")
+    assert "--base-url" in err
+    assert "secret" not in err
+    assert server.received == []
+
+
+def test_check_base_url_accepts_an_idna_host():
+    assert seed.check_base_url("http://bücher.example/api") == "http://bücher.example/api"
 
 
 @pytest.mark.parametrize(
@@ -261,6 +311,27 @@ def test_missing_file_exits_2_and_posts_nothing(capsys, server, tmp_path):
     assert (code, out) == (2, "")
     assert "cannot read" in err and "missing.json" in err
     assert server.received == []
+
+
+@pytest.mark.parametrize("name", ["evil\x1b[2J.json", "two\nlines.json", "bell\x07\u2028.json"])
+def test_file_path_is_escaped_in_errors(capsys, server, tmp_path, name):
+    path = tmp_path / name
+    code, out, err = run_seed(capsys, "--base-url", server.base_url, "--file", str(path))
+    assert (code, out) == (2, "")
+    assert err.startswith("seed: cannot read ") and err.endswith("\n")
+    assert err.count("\n") == 1
+    assert_no_raw_control(err)
+    assert "\x07" not in err
+    assert seed.escape_display(name) in err
+    assert server.received == []
+
+
+def test_load_tickets_escapes_the_path_in_every_message(tmp_path):
+    path = tmp_path / "t.json"
+    path.write_text("[]", encoding="utf-8")
+    with pytest.raises(seed.UsageError) as excinfo:
+        seed.load_tickets(path)
+    assert str(excinfo.value) == f"{path} holds no tickets"
 
 
 def test_utf8_bom_is_rejected(capsys, server, tmp_path):
@@ -438,6 +509,49 @@ def test_oversized_responses_are_cut_short(capsys, server, tmp_path, reply, line
     code, out, _ = run_seed(capsys, "--base-url", server.base_url, "--file", str(tickets_file(tmp_path, TWO)))
     assert code == 1
     assert out.splitlines() == [line, "t-2 202 Accepted", "2 tickets: 1 accepted, 0 already stored, 1 other"]
+
+
+REDIRECTS = [
+    (301, "Moved Permanently"),
+    (302, "Found"),
+    (303, "See Other"),
+    (307, "Temporary Redirect"),
+    (308, "Permanent Redirect"),
+]
+
+
+@pytest.mark.parametrize(("status", "phrase"), REDIRECTS, ids=[str(status) for status, _ in REDIRECTS])
+def test_redirects_are_not_followed(capsys, server, tmp_path, status, phrase):
+    # Followed, a 301 to 303 turns the POST into a GET, whose 200 with the ticket would pass as stored.
+    location = f"{server.base_url}/tickets/t-1"
+    server.reply(Reply(status, SENTINEL.encode(), "text/plain", headers=(("Location", location),)), Reply(202))
+    code, out, err = run_seed(capsys, "--base-url", server.base_url, "--file", str(tickets_file(tmp_path, TWO)))
+    assert code == 1
+    assert out.splitlines() == [
+        f"t-1 {status} {phrase}",
+        "t-2 202 Accepted",
+        "2 tickets: 1 accepted, 0 already stored, 1 other",
+    ]
+    assert err == ""
+    assert [(r.method, r.path) for r in server.received] == [("POST", "/tickets"), ("POST", "/tickets")]
+    assert location not in out and SENTINEL not in out
+
+
+@pytest.mark.parametrize("location", ["ftp://127.0.0.1/x", "file:///etc/hosts", "http://192.0.2.1/tickets"])
+def test_redirects_to_other_schemes_or_hosts_are_not_followed(capsys, server, tmp_path, location):
+    server.reply(Reply(302, b"", headers=(("Location", location),)), Reply(202))
+    path = str(tickets_file(tmp_path, TWO))
+    code, out, err = run_seed(capsys, "--base-url", server.base_url, "--file", path, "--timeout", "2")
+    assert (code, err) == (1, "")
+    assert out.splitlines()[0] == "t-1 302 Found"
+    assert location not in out
+    assert [r.method for r in server.received] == ["POST", "POST"]
+
+
+def test_redirect_target_answers_like_a_stored_ticket(server):
+    # The GET handler the redirect tests point at would pass as already stored if it were reached.
+    assert get_json(f"{server.base_url}/tickets/t-1")["id"] == "t-1"
+    assert [r.method for r in server.received] == ["GET"]
 
 
 def test_format_line():

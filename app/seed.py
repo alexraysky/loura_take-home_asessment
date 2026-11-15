@@ -95,10 +95,18 @@ def check_base_url(url: str) -> str:
 
     ``file:`` is refused because ``urlopen`` would read a local file. A path prefix is kept
     (``http://host/api`` posts to ``/api/tickets``), a query or fragment is refused, and so are
-    credentials, which would end up in the output.
+    credentials, which would end up in the output; they are checked first, so no other message
+    echoes them. A host must be valid IDNA and a path ASCII, or the request would fail to encode.
     """
+    if any(ch.isspace() or _is_unsafe(ch) for ch in url):
+        raise ValueError("--base-url must not contain whitespace or control characters")
     try:
         parts = urllib.parse.urlsplit(url)
+    except ValueError:
+        raise ValueError("--base-url is not a valid URL") from None
+    if parts.username is not None or parts.password is not None:
+        raise ValueError("--base-url must not contain credentials")
+    try:
         _ = parts.port  # ValueError for a port that is not a number in range
     except ValueError:
         raise ValueError(f"--base-url is not a valid URL: {url!r}") from None
@@ -106,10 +114,16 @@ def check_base_url(url: str) -> str:
         raise ValueError(f"--base-url must start with http:// or https://, got {url!r}")
     if not parts.hostname:
         raise ValueError(f"--base-url has no host: {url!r}")
-    if parts.username is not None or parts.password is not None:
-        raise ValueError("--base-url must not contain credentials")
     if parts.query or parts.fragment:
         raise ValueError(f"--base-url must not have a query or fragment: {url!r}")
+    try:
+        parts.hostname.encode("idna")
+    except UnicodeError:
+        raise ValueError(f"--base-url has an invalid host: {url!r}") from None
+    try:
+        parts.path.encode("ascii")
+    except UnicodeError:
+        raise ValueError(f"--base-url path must be ASCII (percent-encode it): {url!r}") from None
     return urllib.parse.urlunsplit((parts.scheme, parts.netloc, parts.path.rstrip("/"), "", ""))
 
 
@@ -157,26 +171,27 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
 def load_tickets(path: Path) -> list[dict[str, str]]:
     """The tickets in ``path``, checked for shape only; the API's own rules are left to the server.
 
-    Messages name the file and an entry's index, never its content.
+    Messages name the file, escaped for the terminal, and an entry's index, never its content.
     """
+    shown = escape_display(str(path))
     try:
         raw = path.read_bytes()
     except OSError as exc:
-        raise UsageError(f"cannot read {path} ({type(exc).__name__})") from None
+        raise UsageError(f"cannot read {shown} ({type(exc).__name__})") from None
     if raw.startswith(codecs.BOM_UTF8):
-        raise UsageError(f"{path} starts with a byte order mark; save it as UTF-8 without one")
+        raise UsageError(f"{shown} starts with a byte order mark; save it as UTF-8 without one")
     try:
         data = json.loads(raw.decode("utf-8"))
     except UnicodeDecodeError:
-        raise UsageError(f"{path} is not UTF-8") from None
+        raise UsageError(f"{shown} is not UTF-8") from None
     except json.JSONDecodeError as exc:
-        raise UsageError(f"{path} is not valid JSON (line {exc.lineno}, column {exc.colno})") from None
+        raise UsageError(f"{shown} is not valid JSON (line {exc.lineno}, column {exc.colno})") from None
     except RecursionError:
-        raise UsageError(f"{path} is nested too deeply") from None
+        raise UsageError(f"{shown} is nested too deeply") from None
     if not isinstance(data, list):
-        raise UsageError(f"{path} must hold a JSON array of tickets")
+        raise UsageError(f"{shown} must hold a JSON array of tickets")
     if not data:
-        raise UsageError(f"{path} holds no tickets")
+        raise UsageError(f"{shown} holds no tickets")
     for index, entry in enumerate(data):
         if not isinstance(entry, dict):
             problem = "is not an object"
@@ -188,8 +203,22 @@ def load_tickets(path: Path) -> list[dict[str, str]]:
             problem = "has a value that is not a string"
         else:
             continue
-        raise UsageError(f"entry {index} in {path} {problem}")
+        raise UsageError(f"entry {index} in {shown} {problem}")
     return data
+
+
+class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
+    """Refuses every redirect, so a 3xx surfaces as an HTTPError like any other non-2xx status.
+
+    Followed, a 301, 302 or 303 turns the POST into a GET, and a GET that returns the ticket would
+    count as already stored though nothing was posted.
+    """
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
+_OPENER = urllib.request.build_opener(_NoRedirectHandler)
 
 
 def post_ticket(base_url: str, ticket: dict[str, str], *, timeout: float) -> Outcome:
@@ -202,12 +231,13 @@ def post_ticket(base_url: str, ticket: dict[str, str], *, timeout: float) -> Out
     )
     try:
         try:
-            with urllib.request.urlopen(request, timeout=timeout) as response:
+            with _OPENER.open(request, timeout=timeout) as response:
                 ticket_like = response.status in (HTTPStatus.OK, HTTPStatus.ACCEPTED)
                 body = response.read(MAX_TICKET_BYTES if ticket_like else MAX_ERROR_BYTES)
                 return _outcome(ticket["id"], response.status, response.reason, body)
         except urllib.error.HTTPError as exc:
-            # Every status urlopen does not return; the context manager closes its socket.
+            # Every status the opener does not return, redirects included; the context manager
+            # closes its socket.
             with exc:
                 return _outcome(ticket["id"], exc.code, exc.reason, exc.read(MAX_ERROR_BYTES))
     except (urllib.error.URLError, http.client.HTTPException, OSError) as exc:
