@@ -8,7 +8,7 @@ import pytest
 
 from app.db import BUSY_TIMEOUT_S, Database
 from app.models import CATEGORIES, PRIORITIES, STATUSES
-from app.repository import _CLAIM_SQL, _COLUMNS, _list_query
+from app.repository import _CLAIM_SQL, _COLUMNS, _RELEASE_CLAIMS_SQL, _list_query
 
 NOW = "2026-11-14T12:00:00.000000Z"
 
@@ -246,6 +246,12 @@ def test_claim_statement_uses_the_index(db):
         rows = conn.execute(f"EXPLAIN QUERY PLAN {_CLAIM_SQL}", {"lease_cutoff": NOW, "now": NOW}).fetchall()
     plan = [row["detail"] for row in rows]
     assert any("USING INDEX idx_tickets_claim" in detail for detail in plan)
+
+
+def test_release_claims_statement_uses_the_index(db):
+    with db.connection() as conn:
+        rows = conn.execute(f"EXPLAIN QUERY PLAN {_RELEASE_CLAIMS_SQL}", {"now": NOW}).fetchall()
+    assert any("USING INDEX idx_tickets_claim" in row["detail"] for row in rows)
 
 
 @pytest.mark.parametrize("after", [None, (NOW, "t-1")], ids=["first-page", "cursor"])

@@ -491,3 +491,59 @@ def test_flagged_is_bound_as_an_integer(repository, db, finish):
     assert (stored.flagged, stored.flag_reason) == (True, FLAG_REASON_ECHO)
     with db.connection() as conn:
         assert tuple(conn.execute("SELECT typeof(flagged), flagged FROM tickets").fetchone()) == ("integer", 1)
+
+
+# Startup claim reset.
+
+
+def test_release_all_claims_clears_only_claimed_pending_rows(repository, db, clock):
+    ids = ("claimed", "claimed-last", "retry-later", "new", "classified", "classified-claimed", "failed-claimed")
+    for id in ids:
+        repository.insert_ticket(id, "", "x")
+    assert [claim(repository).id for _ in range(2)] == ["claimed", "claimed-last"]
+    set_columns(db, "claimed", flagged=1, flag_reason=FLAG_REASON_ECHO, last_error="not_json")
+    set_columns(db, "claimed-last", attempts=3)
+    later = format_ts(clock() + timedelta(seconds=30))
+    set_columns(db, "retry-later", attempts=1, last_error="llm_timeout", next_attempt_at=later)
+    labels = {"status": "classified", "category": "other", "priority": "low", "summary": "x"}
+    set_columns(db, "classified", **labels)
+    # Finish writes always clear the claim; these terminal rows are planted to prove the status filter.
+    set_columns(db, "classified-claimed", **labels, claimed_at=format_ts(clock()))
+    set_columns(db, "failed-claimed", status="failed", last_error="not_json", claimed_at=format_ts(clock()))
+    before = {id: repository.get_ticket(id) for id in ids}
+    clock.advance(5)
+    assert repository.release_all_claims() == 2
+    now = format_ts(clock())
+    for id, ticket in before.items():
+        expected = replace(ticket, claimed_at=None, updated_at=now) if id in ("claimed", "claimed-last") else ticket
+        assert repository.get_ticket(id) == expected
+
+
+def test_release_all_claims_on_an_empty_table_returns_zero(repository):
+    assert repository.release_all_claims() == 0
+    repository.insert_ticket("t-1", "", "x")
+    claim(repository)
+    assert repository.release_all_claims() == 1
+    assert repository.release_all_claims() == 0
+
+
+def test_released_ticket_is_claimable_at_once_and_keeps_its_attempts(repository, clock):
+    repository.insert_ticket("t-1", "", "x")
+    first = claim(repository)
+    clock.advance(1)  # well inside the lease
+    assert claim(repository) is None
+    assert repository.release_all_claims() == 1
+    second = claim(repository)
+    assert (second.id, second.attempts) == ("t-1", 2)
+    assert second.claimed_at != first.claimed_at
+
+
+@pytest.mark.parametrize("finish", FINISHES.values(), ids=FINISHES.keys())
+def test_finish_with_a_pre_reset_token_is_ignored(repository, clock, finish):
+    repository.insert_ticket("t-1", "", "x")
+    first = claim(repository)
+    repository.release_all_claims()
+    clock.advance(1)
+    second = claim(repository)
+    assert finish(repository, first.claimed_at) is False
+    assert repository.get_ticket("t-1") == second
