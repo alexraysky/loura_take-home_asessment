@@ -318,24 +318,76 @@ _PREVENTIVE = (
     "plan for",
     "risk of",
     "what (?:happens|would happen)",
+    # "What if I can't log in?" only ever imagines the problem; it never reports one.
+    "what if",
 )
 # A bare conditional ("in case", "in the event", "if" but not "even if", "whether", "suppose") is
-# hypothetical only in a question: "What if I can't log in?", "In case the export fails, what
-# should I do?". In a statement it frames a fact: "Even if I reset my password I can't log in.",
-# "Whether I use Chrome or Firefox the export fails.", "Not sure if anyone noticed the API is down."
+# hypothetical only in a question: "If production goes down, what should I do?", "In case the export
+# fails, what should I do?". In a statement it frames a fact: "Even if I reset my password I can't
+# log in.", "Whether I use Chrome or Firefox the export fails.", "Not sure if anyone noticed the API
+# is down." Even in a question it can give the steps to reproduce a reported problem: "If I try to
+# log in, I get an error, can you help?" (see _states).
 _CONDITIONAL = (
     "in case",
     "in the event",
-    "(?<!even )if",
+    "(?<!even )(?<!what )if",
     "whether",
     "suppose",
 )
 _PREVENTIVE_RE = _cues(*_PREVENTIVE)
+_BARE_CONDITIONAL_RE = _cues(*_CONDITIONAL)
 _HYPOTHETICAL_RE = _cues(*_PREVENTIVE, *_CONDITIONAL)
 # Conditional cues in a how-to clause with no reason keep their question scope across a comma: "How
 # can I fix it if production goes down, will all users be locked out?" Preventive verbs are left
 # out, so "How can I avoid an outage; our API is down." still reports the outage.
-_CONDITIONAL_RE = _cues(*_CONDITIONAL, "what (?:happens|would happen)")
+_CONDITIONAL_RE = _cues(*_CONDITIONAL, "what (?:happens|would happen|if)")
+# A bare conditional that gives the steps to reproduce a problem has a declarative consequent after
+# its condition verb in the same clause: "If I try to log in I get an error, can you help?", "If our
+# customers use the production API it returns 500 errors, can you help?". "If I am charged twice,
+# how do I get a refund?" has no condition verb, so it stays hypothetical. Each is searched once per
+# clause, the consequent only after the first condition verb, so the cost stays linear.
+_CONDITION_RE = _cues(
+    "use[sd]?",
+    "using",
+    "try",
+    "trying",
+    "tried",
+    "click(?:s|ed|ing)?",
+    "open(?:s|ed|ing)?",
+    "run(?:s|ning)?",
+    "ran",
+    "call(?:s|ed|ing)?",
+    "send(?:s|ing)?",
+    "sent",
+    "submit(?:s|ted|ting)?",
+    "upload(?:s|ed|ing)?",
+    "export(?:s|ed|ing)?",
+    "import(?:s|ed|ing)?",
+    "reset(?:s|ting)?",
+    "chang(?:e|es|ed|ing)",
+    "updat(?:e|es|ed|ing)",
+    "sav(?:e|es|ed|ing)",
+    "select(?:s|ed|ing)?",
+    "enter(?:s|ed|ing)?",
+    "enabl(?:e|es|ed|ing)",
+    "disabl(?:e|es|ed|ing)",
+    "visit(?:s|ed|ing)?",
+    "load(?:s|ed|ing)?",
+    "refresh(?:es|ed|ing)?",
+    "install(?:s|ed|ing)?",
+    "deploy(?:s|ed|ing)?",
+    "restart(?:s|ed|ing)?",
+    "log(?:s|ged|ging)? ?(?:in|on)",
+    "sign(?:s|ed|ging)? ?(?:in|on)",
+    "happens?",
+    "occurs?",
+)
+_CONSEQUENT_RE = re.compile(
+    r"\b(?:then )?(?:i|we|it|they|there)"
+    r"(?: (?:am|is|are|was|were|have|has|had|can'?t|cannot|won'?t|don'?t|doesn'?t|didn'?t|keeps?|kept"
+    r"|gets?|got|see|saw|returns?|returned|throws?|threw|fails?|failed|crash(?:es|ed)?|freezes?|froze)"
+    r"|'m|'s|'re|'ve)(?!\w)"
+)
 # The cue counts only in the same clause, before the impact words: "We tried to prevent it, but
 # now the API is down." and "I tried to avoid it and now I am locked out." still report the problem.
 # In a question a hypothetical clause also covers the clauses after it up to an explicit contrast:
@@ -530,17 +582,23 @@ _REASON_RE = _cues(
     r"(?:refund(?:ed)?|reimburs(?:ed?|ement)|credit(?:ed)?) (?:for|on|after)",
 )
 # A clause after a comma that asserts something on its own ends the how-to question before it: "How
-# can I log in, I am locked out." It must not open with a subordinator, preposition or conjunction
-# and must hold a finite verb, so lists and subordinate clauses stay part of the question: "How do I
-# handle errors, timeouts, and crashes in production?", "How do I configure retries, when an export
-# fails?". Matched from the clause start with one lazy scan, so the cost stays linear in its length.
+# can I log in, I am locked out." It must not open with a subordinator, preposition, conjunction,
+# question word, inverted auxiliary or a request for help or a refund, and must hold a subject before
+# a finite verb, so lists, subordinate clauses and follow-up questions stay part of the question:
+# "How do I handle errors, timeouts, and crashes in production?", "How do I configure retries, when
+# an export fails?", "If production goes down, will all users be locked out?". Matched from the
+# clause start with a possessive subject word and one lazy scan, so the cost stays linear in its
+# length.
 _ASSERTED_CLAUSE_RE = re.compile(
     r"\s*+(?!(?:if|when|whenever|while|where|unless|until|before|after|without|by|to|for|with|in|on"
-    r"|during|and|or|whether|suppose|even)(?!\w))"
-    r".*?\b(?:am|is|are|was|were|'m|'s|'re|have|has|had|'ve|can'?t|cannot|won'?t|don'?t|doesn'?t"
+    r"|during|and|or|whether|suppose|even|what|how|why|who|which|will|would|can|could|should|do|does"
+    r"|did|is|are|was|were|have|has|had|get|gets|need|needs|want|wants|looking|asking|refund"
+    r"|reimburse|credit)(?!\w))"
+    r"(?:\w[\w'-]*+\s++.*?\b(?:am|is|are|was|were|have|has|had|can'?t|cannot|won'?t|don'?t|doesn'?t"
     r"|didn'?t|keeps?|kept|gets?|got|see|saw|found|lost|tried|asked|wrote|needs?|owes?|went"
     r"|returns?|returned|throws?|threw|fails?|failed|crash(?:es|ed)?|freezes?|froze|stopped|charged"
-    r"|billed|overcharged|locked|blocked)(?!\w)",
+    r"|billed|overcharged|locked|blocked)(?!\w)"
+    r"|\w++(?:'m|'s|'re|'ve)(?!\w))",
     re.S,
 )
 # Negation right before an impact cue denies it: "There is no outage.", "We did not experience an
@@ -791,7 +849,6 @@ def classify_text(subject: str, body: str) -> dict[str, Any]:
     else:
         priority = "low"
 
-    chasing = repeated and not (impaired or money_owed or deadline)
     summary = _summary_for(
         category,
         priority,
@@ -805,7 +862,6 @@ def classify_text(subject: str, body: str) -> dict[str, Any]:
         deadline=deadline,
         feature=feature,
         impaired=impaired,
-        chasing=chasing,
     )
     return {
         "category": category,
@@ -830,12 +886,11 @@ def _summary_for(
     deadline: bool,
     feature: bool,
     impaired: bool,
-    chasing: bool,
 ) -> str:
     # Templates only, never ticket text, so a summary can not echo or obey the ticket. The flags
     # are the ones that set the priority, so a summary never states what the ticket only asks about.
-    # ``chasing`` says a follow-up is the only reason for a medium priority; ``production`` and
-    # ``wide`` say a high-impact sentence reports a production problem or many users affected.
+    # A medium ticket with none of them is medium only for a follow-up; ``production`` and ``wide``
+    # say a high-impact sentence reports a production problem or many users affected.
     if priority == "high":
         if production and wide:
             return "Customer reports a production problem affecting many users."
@@ -856,7 +911,18 @@ def _summary_for(
         if impaired:
             return "Customer reports a billing problem that blocks their request."
         return "Customer is following up on an unresolved billing problem."
-    if priority == "medium" and chasing:
+    # A deadline alone raises an account or technical request with nothing broken: "Please add a
+    # seat to my account by Friday." must not read as a lockout or a blocking error.
+    if priority == "medium":
+        if impaired:
+            return _SUMMARIES[(category, "medium")]
+        if deadline:
+            article = "an" if category == "account" else "a"
+            return f"Customer needs {article} {category} matter resolved before a stated deadline."
+        if double_charged:
+            return "Customer was charged twice and requests a refund of one charge."
+        if money_owed:
+            return _SUMMARIES[("billing", "medium")]
         return f"Customer is following up on an unresolved {category} request."
     if (
         category == "billing"
@@ -1001,7 +1067,12 @@ def _states(
     must also match in the clause of the match: "Production is fine, but the staging export fails."
     In a question a clause with a cue makes the clauses after it hypothetical too, up to a contrast
     ("but", "yet", "and now"): "If production goes down, will all users be locked out?" asks, "If
-    we skip the deploy, but production is still down, what should we do?" reports.
+    we skip the deploy, but production is still down, what should we do?" reports. A bare
+    conditional carries only up to a clause asserted on its own, and in its own clause does not
+    cover a match after a declarative consequent of a condition verb, so the steps to reproduce a
+    problem do not hide it: "If I try to log in, I get an error, can you help?" and "If I try to
+    log in I get an error, can you help?" report the error. A preventive cue ("What if", "What
+    happens if", "avoid") always carries: "What if I try to log in, I get an error?" asks.
 
     One pass over the matches and clause separators, each clause searched for a cue at most once,
     so a long body is never rescanned per match. Every impact cue starts on a word character after
@@ -1014,30 +1085,50 @@ def _states(
     cues = _HYPOTHETICAL_RE if question else _PREVENTIVE_RE
     separators = _CLAUSE_SPLIT_RE.finditer(text)
     separator = next(separators, None)
+    never = len(text) + 1
     # has_cue is None until the current clause is searched; carried means an earlier clause of the
-    # question was hypothetical with no contrast since.
-    clause_start, cue_end, has_cue, carried = 0, None, None, False
+    # question was hypothetical with no contrast since, and strong that one of those had a
+    # preventive cue. Matches from open_start up to open_end follow the consequent of a bare
+    # conditional in their own clause, so its cue does not cover them.
+    clause_start, cue_end, has_cue, carried, strong = 0, None, None, False, False
+    open_start = open_end = never
     for m in pattern.finditer(text):
         while separator is not None and separator.end() <= m.start():
             if question and separator.group() not in _SOFT_SEPARATORS:
-                carried = False
-            elif question and not carried:
-                if has_cue is None:
-                    has_cue = cues.search(text[clause_start : separator.start()]) is not None
-                carried = has_cue
+                carried = strong = False
+            elif question:
+                previous = text[clause_start : separator.start()]
+                if not carried:
+                    if has_cue is None:
+                        has_cue = cues.search(previous) is not None
+                    carried = has_cue
+                if carried and not strong:
+                    strong = _PREVENTIVE_RE.search(previous) is not None
             clause_start, cue_end, has_cue = separator.end(), None, None
             separator = next(separators, None)
+            clause_end = separator.start() if separator is not None else len(text)
+            # Only a bare conditional ends at a clause asserted on its own after a soft separator.
+            if carried and not strong and _ASSERTED_CLAUSE_RE.match(text, clause_start, clause_end):
+                carried = False
         if cue_end is None:
             clause_end = separator.start() if separator is not None else len(text)
             clause = text[clause_start:clause_end]
+            open_start = open_end = never
             if carried or (require is not None and not require.search(clause)):
                 # No match in this clause counts: every one starts at or after clause_start.
                 cue_end = clause_start
             else:
                 cue = cues.search(clause)
                 has_cue = cue is not None
-                cue_end = clause_start + cue.end() if cue else len(text) + 1
-        if cue_end > m.start() and not _NEGATED_RE.search(
+                cue_end = clause_start + cue.end() if cue else never
+                if cue is not None and question and _BARE_CONDITIONAL_RE.match(clause, cue.start()):
+                    condition = _CONDITION_RE.search(clause, cue.end())
+                    consequent = condition and _CONSEQUENT_RE.search(clause, condition.end())
+                    if consequent:
+                        preventive = _PREVENTIVE_RE.search(clause, consequent.start())
+                        open_start = clause_start + consequent.start()
+                        open_end = clause_start + preventive.end() if preventive else never
+        if (cue_end > m.start() or open_start <= m.start() < open_end) and not _NEGATED_RE.search(
             text, max(clause_start, m.start() - _NEGATION_WINDOW), m.start()
         ):
             return True

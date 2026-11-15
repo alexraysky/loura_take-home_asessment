@@ -1781,3 +1781,112 @@ def test_invoice_change_requests_use_the_neutral_billing_summary(body):
     answer = classify_text("", body)
     assert (answer["category"], answer["priority"]) == ("billing", "low")
     assert answer["summary"] == "Customer asks a question about billing."
+
+
+@pytest.mark.parametrize(
+    ("body", "category", "priority", "summary"),
+    [
+        (
+            "If I try to log in, I get an error, can you help?",
+            "technical",
+            "medium",
+            "Customer reports an error that blocks their work.",
+        ),
+        (
+            "If I try to log in I get an error, can you help?",
+            "technical",
+            "medium",
+            "Customer reports an error that blocks their work.",
+        ),
+        (
+            "If I try to log in, I can't access my account, can you help?",
+            "account",
+            "medium",
+            "Customer cannot access their account and needs it restored.",
+        ),
+        (
+            "If our customers use the production API it returns 500 errors, can you help?",
+            "technical",
+            "high",
+            "Customer reports a severe production problem.",
+        ),
+        (
+            "If I click export, the page crashes in production, what should I do?",
+            "technical",
+            "high",
+            "Customer reports a severe production problem.",
+        ),
+    ],
+)
+def test_conditional_reproduction_steps_before_a_help_question_still_report_the_problem(
+    body, category, priority, summary
+):
+    # A bare "if" that gives the steps to reproduce a problem does not make the problem hypothetical,
+    # with or without a comma before the consequent.
+    answer = classify_text("", body)
+    assert (answer["category"], answer["priority"], answer["summary"]) == (category, priority, summary)
+
+
+@pytest.mark.parametrize(
+    ("body", "category"),
+    [
+        ("What if I can't log in?", "account"),
+        ("What if I try to log in, I get an error?", "technical"),
+        ("If production goes down, can I get help with the outage?", "technical"),
+        ("If I am charged twice, how do I get a refund?", "billing"),
+        ("If we are charged twice, how can I get a refund for the duplicate charge?", "billing"),
+        ("If I get an error, what happens?", "technical"),
+        ("What happens if production goes down, will all users be locked out?", "technical"),
+    ],
+)
+def test_hypothetical_conditional_questions_stay_low(body, category):
+    answer = classify_text("", body)
+    assert (answer["category"], answer["priority"]) == (category, "low")
+
+
+@pytest.mark.parametrize(
+    ("body", "category", "summary"),
+    [
+        (
+            "Please add a seat to my account by Friday.",
+            "account",
+            "Customer needs an account matter resolved before a stated deadline.",
+        ),
+        (
+            "Please configure the API by Friday.",
+            "technical",
+            "Customer needs a technical matter resolved before a stated deadline.",
+        ),
+        (
+            "I cannot log in to my account and I need access by Friday.",
+            "account",
+            "Customer cannot access their account and needs it restored.",
+        ),
+        (
+            "The export fails with an error and I need it by Friday.",
+            "technical",
+            "Customer reports an error that blocks their work.",
+        ),
+    ],
+)
+def test_deadline_summaries_name_a_blocker_only_when_one_is_reported(body, category, summary):
+    answer = classify_text("", body)
+    assert (answer["category"], answer["priority"], answer["summary"]) == (category, "medium", summary)
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        "If I " + "use the api with errors " * 800 + "?",
+        "If I click export, " + "the page with errors " * 900 + "?",
+        "How do I fix it, " + "the big page " * 1500 + "?",
+        "If " + "word " * 3900 + "error?",
+    ],
+)
+def test_long_conditional_questions_without_a_consequent_classify_in_linear_time(body):
+    # No consequent verb and no asserted clause anywhere, so every error stays hypothetical.
+    assert len(body) <= 20_000
+    start = time.monotonic()
+    answer = classify_text("", body)
+    assert time.monotonic() - start < 0.5
+    assert answer["priority"] == "low"
