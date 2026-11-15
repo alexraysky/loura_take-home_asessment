@@ -1,7 +1,10 @@
+import asyncio
 import logging
 import os
 import sqlite3
+import time
 from contextlib import closing
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -13,8 +16,10 @@ from app.api import ApiError
 from app.clock import utc_now
 from app.config import Settings
 from app.db import Database
+from app.llm import FakeLLM, Mode
 from app.main import create_app
 from app.repository import Repository
+from app.worker import WorkerPool
 
 
 class Item(BaseModel):
@@ -243,3 +248,128 @@ def test_repository_works_after_startup(client):
 def test_in_memory_db_path_fails_at_create_app(db_path):
     with pytest.raises(ValueError, match="DB_PATH"):
         create_app(Settings(worker_count=0, db_path=db_path))
+
+
+# Model client and workers.
+
+T1001 = {
+    "id": "t-1001",
+    "subject": "Charged twice this month",
+    "body": "Hi, I see two charges on my card for this month. Can you refund one of them?",
+}
+DEADLINE_S = 5.0
+
+
+class GateLLM:
+    """Parks every call forever; counts the parked calls."""
+
+    def __init__(self) -> None:
+        self.parked = 0
+
+    async def complete(self, system: str, user: str) -> str:
+        self.parked += 1
+        await asyncio.Event().wait()
+        raise AssertionError("unreachable")
+
+
+@pytest.fixture
+def worker_settings(settings: Settings) -> Settings:
+    # backoff 0: a retry is claimable at once, so the frozen FakeClock never needs to move.
+    return replace(
+        settings, worker_count=2, poll_interval_s=0.001, backoff_base_s=0.0, llm_timeout_s=1.0, lease_timeout_s=2.0
+    )
+
+
+def wait_until(predicate, what: str):
+    deadline = time.monotonic() + DEADLINE_S
+    while time.monotonic() < deadline:
+        if result := predicate():
+            return result
+        time.sleep(0.005)
+    raise AssertionError(f"timed out waiting for {what}")
+
+
+def wait_for_status(client: TestClient, id: str, status: str) -> dict:
+    def check():
+        body = client.get(f"/tickets/{id}").json()
+        return body if body["status"] == status else None
+
+    return wait_until(check, f"{id} to be {status}")
+
+
+def test_default_llm_is_the_fake_from_settings(settings, clock):
+    settings = replace(settings, fake_llm_seed=7, fake_llm_failure_rate=0.5, fake_llm_gullible=False)
+    llm = create_app(settings, clock=clock).state.llm
+    assert isinstance(llm, FakeLLM)
+    assert (llm.seed, llm.failure_rate, llm.gullible) == (7, 0.5, False)
+
+
+def test_injected_llm_is_on_app_state(settings, clock):
+    fake = FakeLLM(script=[Mode.OK])
+    assert create_app(settings, clock=clock, llm=fake).state.llm is fake
+
+
+@pytest.mark.parametrize("llm", [object(), "fake", FakeLLM.complete])
+def test_non_client_llm_is_rejected(settings, clock, llm):
+    with pytest.raises(TypeError, match="llm must implement LLMClient"):
+        create_app(settings, clock=clock, llm=llm)
+
+
+def test_workers_disabled_leaves_no_tasks(client, caplog):
+    workers = client.app.state.workers
+    assert isinstance(workers, WorkerPool)
+    assert workers.tasks == [] and len(workers) == 0
+
+
+def test_lifespan_starts_and_stops_workers(worker_settings, clock, caplog):
+    caplog.set_level(logging.INFO, logger="app")
+    app = create_app(worker_settings, clock=clock, llm=FakeLLM(failure_rate=0.0, gullible=False))
+    with TestClient(app):
+        tasks = list(app.state.workers.tasks)
+        assert len(tasks) == 2
+        assert not any(task.done() for task in tasks)
+    assert all(task.done() for task in tasks)
+    assert app.state.workers.tasks == []
+    messages = [r.getMessage() for r in caplog.records]
+    assert "starting 2 workers" in messages
+    assert messages[-1] == "workers stopped"
+
+
+def test_posted_ticket_is_classified_by_the_workers(worker_settings, clock):
+    app = create_app(worker_settings, clock=clock, llm=FakeLLM(failure_rate=0.0, gullible=False))
+    with TestClient(app) as client:
+        assert client.post("/tickets", json=T1001).status_code == 202
+        body = wait_for_status(client, "t-1001", "classified")
+    assert body["category"] is not None and body["priority"] is not None and body["summary"]
+    assert (body["attempts"], body["prompt_version"], body["last_error"]) == (1, "v1", None)
+
+
+def test_retry_under_the_lifespan(worker_settings, clock):
+    app = create_app(worker_settings, clock=clock, llm=FakeLLM(script=[Mode.TIMEOUT, Mode.OK]))
+    with TestClient(app) as client:
+        client.post("/tickets", json=T1001)
+        body = wait_for_status(client, "t-1001", "classified")
+    assert (body["attempts"], body["last_error"]) == (2, None)
+
+
+def test_shutdown_with_an_in_flight_call_keeps_the_claim(worker_settings, clock):
+    gate = GateLLM()
+    app = create_app(worker_settings, clock=clock, llm=gate)
+    with TestClient(app) as client:
+        client.post("/tickets", json=T1001)
+        wait_until(lambda: gate.parked == 1, "the model call")
+        started = time.monotonic()
+    assert time.monotonic() - started < 2.0
+    stored = app.state.repository.get_ticket("t-1001")
+    # What #8's startup reset will find: a pending row still holding its claim.
+    assert (stored.status, stored.attempts) == ("pending", 1)
+    assert stored.claimed_at is not None
+    assert gate.parked == 1
+
+
+def test_health_still_ok_with_workers_running(worker_settings, clock):
+    app = create_app(worker_settings, clock=clock, llm=FakeLLM(failure_rate=0.0, gullible=False))
+    with TestClient(app) as client:
+        assert len(app.state.workers) == 2
+        response = client.get("/health")
+    assert (response.status_code, response.json()) == (200, {"status": "ok"})
