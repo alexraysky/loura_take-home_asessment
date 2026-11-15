@@ -315,6 +315,16 @@ def test_undecodable_body_is_http_error(client, db):
     assert row_count(db) == 0
 
 
+@pytest.mark.parametrize("headers", [{}, {"content-type": "text/plain"}], ids=["no-content-type", "text-plain"])
+def test_body_not_sent_as_json_is_validation_error(client, db, headers):
+    # Without a JSON content type the body is not parsed: the raw bytes are not an object.
+    response = client.post("/tickets", content=b'{"id": "t-1001", "body": "Hi"}', headers=headers)
+    assert response.request.headers.get("content-type") == headers.get("content-type")
+    details = assert_validation_error(response)
+    assert [(d["loc"], d["type"]) for d in details] == [(["body"], "model_attributes_type")]
+    assert row_count(db) == 0
+
+
 def test_non_object_json_is_validation_error(client):
     details = assert_validation_error(client.post("/tickets", json=["t-1001", "Hi"]))
     assert [(d["loc"], d["type"]) for d in details] == [(["body"], "model_attributes_type")]

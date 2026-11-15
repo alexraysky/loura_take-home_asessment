@@ -26,6 +26,21 @@ The first `make run` or `make test` creates `.venv` from the committed `uv.lock`
 
 `GET /health` (or `HEAD /health`) returns `{"status": "ok"}` once the app has started. It is an operational readiness probe and is not part of the ticket API.
 
+On Windows, GNU make is not installed by default: `winget install ezwinports.make`, or use the commands under Without make. PowerShell sets a variable with `$env:NAME='value'` before the command (`$env:FAKE_LLM_FAILURE_RATE='0'; make run`) instead of the `NAME=value make run` prefix. The curl examples use POSIX shell line continuations; run them from Git Bash or WSL.
+
+### Try it
+
+With the server running:
+
+```sh
+curl -i -X POST http://127.0.0.1:8000/tickets \
+  -H 'content-type: application/json' \
+  -d '{"id": "t-1001", "subject": "Charged twice this month", "body": "Hi, I see two charges of 49.00 on my card statement dated the 3rd and the 4th. I only have one subscription. Can you refund one of them?"}'
+curl -s http://127.0.0.1:8000/tickets/t-1001
+```
+
+The first call answers `202 Accepted` with the ticket in `status: "pending"`. With the default fake settings this ticket draws a simulated failure first, so a few seconds later the second call shows `status: "classified"`, `billing`/`medium`, `attempts: 2` and `prompt_version: "v1"`. The payload is sample ticket t-1001 exactly, so a later `make seed` reports it as already stored. Every endpoint is described under API reference.
+
 ### Without make
 
 The Makefile targets are thin wrappers:
@@ -64,17 +79,19 @@ The expected labels, which are also the worked examples for the priority rubric:
 | t-1009 | technical | medium | no | Second topic (billing) is explicitly deferred; must not win |
 | t-1010 | technical | medium | no | Quoted staff text is not the customer's claim; repeat contact |
 
-With the default fake settings (`FAKE_LLM_SEED=42`, `FAKE_LLM_FAILURE_RATE=0.2`, `FAKE_LLM_GULLIBLE=true`) all ten end `classified` with these labels. Three need a second attempt, 1 to 2 s later: t-1001 and t-1003 draw a simulated failure first, and t-1005's first answer obeys the injection and is rejected by the quote check, so t-1005 ends flagged with reason `summary echoed quoted ticket text`. The draw is a hash of the seed and the prompt, so another seed gives another mix, and a ticket can end `failed`: 0.2³ = 0.8 % per ticket, 0.2² = 4 % for t-1005, whose first attempt always goes to the injection. `FAKE_LLM_FAILURE_RATE=0 make run` gives a run without simulated failures; with `FAKE_LLM_GULLIBLE=false` as well, t-1005 is classified on its first attempt, flagged by the fake with reason `Ticket text addresses the classifier.`
+With the default fake settings (`FAKE_LLM_SEED=42`, `FAKE_LLM_FAILURE_RATE=0.2`, `FAKE_LLM_GULLIBLE=true`) all ten end `classified` with these labels. Three need a second attempt, 1 to 2 s later: t-1001 and t-1003 draw a simulated failure first, and t-1005's first answer obeys the injection and is rejected by the quote check, so t-1005 ends flagged with reason `summary echoed quoted ticket text`. The draw is a hash of the seed, the prompt, and how many times the fake has seen that prompt, so another seed gives another mix, and a ticket can end `failed`: 0.2³ = 0.8 % per ticket, 0.2² = 4 % for t-1005, whose first attempt always goes to the injection. `FAKE_LLM_FAILURE_RATE=0 make run` gives a run without simulated failures; with `FAKE_LLM_GULLIBLE=false` as well, t-1005 is classified on its first attempt, flagged by the fake with reason `Ticket text addresses the classifier.`
 
-## API
+## API reference
 
 ### `POST /tickets`
 
 ```sh
 curl -i -X POST http://127.0.0.1:8000/tickets \
   -H 'content-type: application/json' \
-  -d '{"id": "t-1001", "subject": "Charged twice this month", "body": "Hi, I see two charges..."}'
+  -d '{"id": "t-2001", "subject": "Charged twice this month", "body": "Hi, I see two charges..."}'
 ```
+
+On a database without `t-2001` this answers `202 Accepted` with the ticket in the pending shape shown under Ticket representation, even after Try it and `make seed`. Sending it again unchanged answers `200 OK`; sending it with the id `t-1001` instead, which Try it and `make seed` store with a longer body, answers `409 Conflict`, code `ticket_conflict`.
 
 | Field | Rules |
 |---|---|
@@ -84,6 +101,8 @@ curl -i -X POST http://127.0.0.1:8000/tickets \
 
 Unknown fields are rejected and values are never coerced (a number is not a string). Limits count Unicode code points. Subject and body are stored and returned exactly as received: no trimming or normalisation.
 
+The body must be sent as JSON (`Content-Type: application/json`). Without that header, or with another type such as `text/plain`, the raw bytes are not parsed and the request is `422`, code `validation_error`, type `model_attributes_type`; nothing is stored.
+
 The id makes the request idempotent:
 
 | Case | Response |
@@ -92,6 +111,7 @@ The id makes the request idempotent:
 | Existing id, identical `subject` and `body` | `200 OK`, the stored ticket in its current state; nothing is written or requeued |
 | Existing id, different `subject` or `body` | `409 Conflict`, code `ticket_conflict`; the stored ticket is unchanged |
 | Invalid payload (malformed JSON, or JSON that fails the rules above) | `422`, code `validation_error` |
+| Body not sent as JSON (no `Content-Type`, or a non-JSON one) | `422`, code `validation_error`, type `model_attributes_type` |
 | Body that cannot be decoded or parsed before validation (for example undecodable UTF-8/16/32 bytes, or JSON nested too deeply) | `400`, code `http_error` |
 
 An omitted `subject` and `"subject": ""` are the same payload. Comparison is exact, so a whitespace or line-ending difference is a conflict.
@@ -127,10 +147,10 @@ Tickets are ordered by `created_at` ascending, then `id`, so new tickets land at
 ```json
 {
   "items": [
-    {"id": "t-1001", "status": "classified", "category": "billing", "priority": "high", "...": "..."},
-    {"id": "t-1003", "status": "classified", "category": "billing", "priority": "low", "...": "..."}
+    {"id": "t-1001", "status": "classified", "category": "billing", "priority": "medium", "flagged": false, "...": "..."},
+    {"id": "t-1005", "status": "classified", "category": "billing", "priority": "low", "flagged": true, "flag_reason": "summary echoed quoted ticket text", "...": "..."}
   ],
-  "next_cursor": "MjAyNi0xMS0xNFQxMjowMDowMC4wMDAwMDBafHQtMTAwMw"
+  "next_cursor": "MjAyNi0xMS0xNFQxMjowMDowMC4wMDAwMDBafHQtMTAwNQ"
 }
 ```
 
@@ -163,7 +183,7 @@ The path does not stop a ticket from having the id `reclassify`: `POST /tickets/
 
 ```json
 {
-  "id": "t-1001",
+  "id": "t-2001",
   "subject": "Charged twice this month",
   "body": "Hi, I see two charges...",
   "status": "pending",
@@ -207,11 +227,7 @@ For `validation_error`, `details` lists one `{"loc", "msg", "type"}` entry per p
 
 `invalid_cursor` covers anything that is not exactly a `next_cursor` the service produced: wrong alphabet, padding, length or content.
 
-## Classification worker
-
-The `tickets` table is the queue. `WORKER_COUNT` asyncio tasks in the API process each loop: claim one `pending` ticket, call the model once, validate the answer, write the result. `WORKER_COUNT=0` disables them (the API tests run that way).
-
-A claim is a single `UPDATE … RETURNING` that picks the oldest claimable row (by `created_at`, then `id`), increments `attempts` and sets `claimed_at`. SQLite takes the write lock before the statement's subquery runs, so two workers never take the same row. A row is claimable when it is `pending`, has no live lease (`claimed_at` is `NULL` or older than `LEASE_TIMEOUT_S`) and has no future `next_attempt_at`. Every repository call runs in a thread, so SQLite never blocks the event loop. An idle worker sleeps `POLL_INTERVAL_S` between claims; a busy one claims again at once.
+## Ticket lifecycle
 
 ```text
 POST /tickets -> pending (attempts 0)  <---- POST /tickets/reclassify: failed, or classified with
@@ -230,6 +246,10 @@ labels,          next_attempt_at = now + backoff
 prompt_version
 ```
 
+The `tickets` table is the queue. `WORKER_COUNT` asyncio tasks in the API process each loop: claim one `pending` ticket, call the model once, validate the answer, write the result. `WORKER_COUNT=0` disables them (the API tests run that way).
+
+A claim is a single `UPDATE … RETURNING` that picks the oldest claimable row (by `created_at`, then `id`), increments `attempts` and sets `claimed_at`. SQLite takes the write lock before the statement's subquery runs, so two workers never take the same row. A row is claimable when it is `pending`, has no live lease (`claimed_at` is `NULL` or older than `LEASE_TIMEOUT_S`) and has no future `next_attempt_at`. Every repository call runs in a thread, so SQLite never blocks the event loop. An idle worker sleeps `POLL_INTERVAL_S` between claims; a busy one claims again at once.
+
 A requeue takes the write lock like a claim does, so a row is either reset or claimed, never half of each. A worker still holding a claim from before the reset finds its token gone, and its write is dropped as `stale` (below).
 
 Each attempt builds a fresh prompt, calls the model under `LLM_TIMEOUT_S` and hands the raw text to output validation. An accepted answer makes the ticket `classified` with its labels and `prompt_version`, and clears `last_error`. Anything else releases the claim with `last_error` set and `next_attempt_at = now + BACKOFF_BASE_S · 2^(attempts−1) + jitter` (jitter is up to one more `BACKOFF_BASE_S`), so with the defaults a ticket is retried after 1–2 s and then 2–3 s. Timeouts, unavailability, invalid output and unexpected errors follow the same policy, and `attempts` alone decides when a ticket is terminal: the last of `MAX_ATTEMPTS` attempts that is not accepted makes it `failed` with that attempt's code. Attempts are counted at claim time, so a ticket whose worker dies cannot loop forever: one claimed with more attempts than allowed is marked `failed` with `attempts_exhausted` without another model call.
@@ -245,7 +265,7 @@ Each attempt builds a fresh prompt, calls the model under `LLM_TIMEOUT_S` and ha
 | `unexpected_error` | Any other exception during the attempt (a client bug, non-text output); logged with a sanitized traceback (see below) |
 | `attempts_exhausted` | The ticket was claimed with no attempts left (terminal, no model call) |
 
-Every finishing write is guarded by `WHERE id = ? AND status = 'pending' AND claimed_at = <the claim's timestamp>`, so a worker whose lease expired cannot overwrite the result of the worker that took over; its write matches no row and is logged as `stale`. `flagged` only ever goes up and the first `flag_reason` written is kept, on every outcome: the quote check's flag from a rejected attempt survives a later honest answer or a `failed` ending. Sample ticket t-1005 therefore ends `billing`/`low` with `flagged` true and reason `summary echoed quoted ticket text`, even though the accepted answer carried a reason of its own. A requeue by `POST /tickets/reclassify` is the one operation that lowers `flagged`: it is an operator's action, not the ticket author's, and the next attempt runs the model's flag and the quote check again, so a ticket that still carries the attack is flagged again.
+Every finishing write is guarded by `WHERE id = ? AND status = 'pending' AND claimed_at = <the claim's timestamp>`, so a worker whose lease expired cannot overwrite the result of the worker that took over; its write matches no row and is logged as `stale`. `flagged` only ever goes up and the first `flag_reason` written is kept, on every outcome: the quote check's flag from a rejected attempt survives a later honest answer or a `failed` ending. Sample ticket t-1005 therefore ends `billing`/`low` with `flagged` true and reason `summary echoed quoted ticket text`, even though the accepted answer carried a reason of its own. A requeue by `POST /tickets/reclassify` is the one operation that lowers `flagged`: it is an operator's action, not the ticket author's, and the next attempt runs the model's flag and the quote check again, so a ticket that still carries the attack is flagged again. With the fake the reason can differ: it obeys an injection only on the first call it sees for a prompt, so t-1005 requeued in a long-running process is answered honestly and flagged with the fake's own reason `Ticket text addresses the classifier.`, while in a fresh process the first attempt is hijacked again and the quote check flags it with `summary echoed quoted ticket text`.
 
 Each finished attempt logs one line with the worker, the ticket id, the attempt number, the outcome, the code, the prompt version, whether the body was truncated and the duration, for example `worker-0: t-1005 attempt 1/3 -> retry (summary_echoes_ticket) prompt=v1 truncated=false 0.004s`. Ticket text, prompts and model text are never logged. An unexpected exception, in an attempt or anywhere in the worker loop, is logged at ERROR as the type names and stack frames of the exception and of its chained causes, contexts and group members, with every exception message omitted (`ValueError (message omitted)`): a client or SDK error message can echo the prompt (the ticket) or the model's response, so it never reaches the log.
 
@@ -290,7 +310,39 @@ Known limits:
 - `flag_reason` is free model text and is not checked for quoted ticket text.
 - The one-sentence rule is a heuristic: "Mr. Smith asks for a refund." is rejected and retried. Emoji joined with zero-width joiners are rejected as format characters.
 
-## Prompt and injection mitigation
+## Decisions
+
+One paragraph per open question in the brief: the decision, why, and the alternative that was rejected.
+
+**Stack.** Python 3.15, FastAPI, Pydantic, the standard library's `sqlite3` and pytest, at the latest stable releases as of 14 November 2026. `uv.lock` pins Python 3.15.2, FastAPI 0.163.0 (Starlette 1.10.0), Pydantic 2.14.3, uvicorn 0.54.0, pytest 9.2.0 with pytest-asyncio 1.5.0, and httpx with httpx2 for the test client; the interpreter bundles SQLite 3.53.1 (3.35 or later is needed for `RETURNING` and checked at startup). `pyproject.toml` holds only the floors (Python `>=3.15`, `fastapi>=0.162`, `pydantic>=2.14`, `pytest>=9.1`). Reason: uv installs the exact set, Python included, from a clean clone with one command. Rejected: an ORM or a database server, which add installs and nothing the brief needs.
+
+**Duplicate id.** An identical payload returns `200` with the existing ticket; a different payload returns `409` with `ticket_conflict`. Reason: the same id must not create a duplicate or re-run classification, and a client that retries a `POST` after a lost response gets a safe answer. Rejected: `409` for every repeated id, which breaks exactly that retry, and an upsert, which would change the text under a classified ticket.
+
+**Storage.** SQLite in WAL mode, one short autocommit connection per operation, a 5 s busy timeout. Reason: it runs from a clean clone, the primary key gives idempotent ingest, WAL lets reads run beside the single writer, and CHECK constraints are a last guard against an out-of-set value. Rejected: PostgreSQL, a server to install and run, and an in-memory store, which loses every ticket on restart.
+
+**Async execution.** The tickets table is the queue: asyncio worker tasks in the same process claim rows with one `UPDATE … RETURNING`. Reason: nothing to install, timeouts and cancellation are plain asyncio, and queue state and ticket state live in one row, so they cannot disagree. Rejected: Celery or RQ with a broker, another process and a second source of truth, and FastAPI `BackgroundTasks`, which have no retry and nothing that survives a restart.
+
+**Concurrency.** `WORKER_COUNT` tasks, default 4; `0` disables them. Reason: one number to reason about and to test, and SQLite's single writer caps what more workers would gain. Rejected: one task per ticket spawned at ingest, unbounded and lost on restart.
+
+**In-flight marker.** A `claimed_at` lease on a row that stays `pending`. Reason: the brief names three statuses, so there is no fourth public state, and nothing to roll back after a crash because an expired lease already frees the row. Rejected: a `processing` status, visible to clients and wrong after a crash until something repairs it.
+
+**Restart.** Claims are cleared on startup, before the workers start; while running, an expired lease is claimable again. Processing is at-least-once, and the result write is guarded by the claim token, so only one result is stored. Reason: recovery is immediate instead of waiting out `LEASE_TIMEOUT_S`. Rejected: lease expiry alone, which recovers slower in the single-process case (it is what two processes would need, see Weaknesses), and exactly-once, which an external model call cannot give.
+
+**Retries.** `MAX_ATTEMPTS` 3, exponential backoff with jitter, and the same policy for timeouts, unavailability, invalid output and unexpected errors. Reason: every ticket reaches a terminal state, a retry is cheap, and one policy is one thing to test. Rejected: a policy per error class, more branches with no evidence they need different treatment, and unlimited retries, which never end on a deterministic bug.
+
+**Attempt counting.** `attempts` is incremented at claim time, in the claim statement. Reason: a ticket that crashes the worker cannot loop forever; one claimed with no attempts left ends `failed` with `attempts_exhausted` without another model call. Rejected: counting when an attempt finishes, which never counts an attempt that crashes, so a poison ticket would loop.
+
+**Wrapped JSON.** Rejected as `not_json` and retried, not extracted. Reason: a strict boundary is cheap to enforce and a retry is cheap, while extraction would accept attacker-influenced text around the object and guess between several objects. Rejected: extracting the first `{...}` from prose or code fences.
+
+**Pagination.** A cursor on the position of the last item; the list is ordered by `created_at` ascending, then `id`. Reason: new tickets land at the end, so cursors stay stable, and each page is one index range. Rejected: offset and limit, which shift when tickets are inserted, and a cursor on `id` alone, since ids are client-chosen and carry no time order.
+
+**Flag.** Sticky: the model's flag OR the deterministic quote check; `flagged` only goes up and the first `flag_reason` is kept. Reason: the deterministic part cannot be switched off by the attacker, and a flag set by code survives a later honest answer or a `failed` ending. Rejected: the model's flag alone, which comes from the model the attacker is addressing, and the flag as a gate that blocks classification, which would turn the detector into a lever against the customer.
+
+**"Never stored as-is".** `last_error` holds a short reason code, never the raw model payload; the model's text is not stored in any column and not logged, and unexpected exceptions are logged without their messages. Reason: malformed or hijacked output must not reach storage, and a client error message can echo the prompt. Rejected: a raw-response column or debug logging of model text, which would store or log the attack payload.
+
+**Re-classification.** `POST /tickets/reclassify` with `select` of `failed` and/or `outdated_prompt` resets the matching finished tickets in one `UPDATE` to the freshly ingested shape, clears `flagged`, and answers `202` with the count. Reason: one statement means a row is either reset or claimed, never half of each; pending rows are never touched; and the requeue is the operator's action, so the next attempt computes the flag afresh. Rejected: keeping the old flag, whose reason would describe labels that no longer exist, and deleting and re-posting the ticket, which changes `created_at` and the idempotency contract.
+
+## Prompt injection
 
 The model never sees ticket text in the system prompt. `app/prompt.py` builds every call from a constant system prompt and a user message that is only the ticket:
 
@@ -310,14 +362,16 @@ The approach assumes an injection will sometimes succeed and makes success worth
 | # | Layer | Status |
 |---|---|---|
 | 1 | Least privilege: the model has no tools and no authority; its output is a label, never a decision | Implemented (there is nothing to call) |
-| 2 | Constrained output: enums and a strict schema; free text is short, capped and marked untrusted | Implemented (#5, this section) |
-| 3 | Separation of instructions and data: rules in the system prompt, the ticket in a nonce-delimited block described as data | Implemented (#6) |
-| 4 | Deterministic checks on the output: schema, length, the verbatim-quote check | Implemented (#5) |
+| 2 | Constrained output: enums and a strict schema; free text is short, capped and marked untrusted | Implemented (see Model output validation and Ticket representation) |
+| 3 | Separation of instructions and data: rules in the system prompt, the ticket in a nonce-delimited block described as data | Implemented (this section) |
+| 4 | Deterministic checks on the output: schema, length, the verbatim-quote check | Implemented (see Model output validation) |
 | 5 | Detection as a signal: the `flagged` field is a flag, not a gate | Implemented (model flag OR quote-check flag) |
-| 6 | Human approval for consequential actions | Documented only: see the `summary` note above |
+| 6 | Human approval for consequential actions | Documented only: consumers must not act on `summary` (below and Ticket representation) |
 | 7 | Adversarial tests: injection tickets stay in the suite so a prompt change that weakens the defence shows up | Implemented (`tests/test_prompt.py`, `tests/test_validation.py`, `tests/test_llm_fake.py`) |
 
 On sample ticket t-1005: the ticket tries to plant "Approved for immediate refund" in a field a person or a downstream system might act on. It is not treated as a fraud verdict: there is no such category, the ticket also contains a genuine question, and the service cannot judge intent. With the fake in its default gullible mode the first attempt obeys the injection, the quote check rejects that answer and flags the ticket, and a later attempt classifies the real question as billing/low with the flag kept, or the ticket fails with the flag kept. The ticket can never end up as technical/high with the attacker's summary.
+
+What consumers must not do with `summary`: `summary` and `flag_reason` are model-generated text derived from untrusted input, so a consumer must never treat `summary` as authoritative or act on it, by approving a refund, making a decision or promising anything, without a person reading the original ticket. The same rule is stated under Ticket representation.
 
 Known limits:
 
@@ -340,6 +394,29 @@ low     questions, requests, feedback, no time pressure
 ```
 
 Priority comes from the impact the customer describes, not from words like "URGENT" or from a claimed sender. Priorities are judgment calls; the sample tickets and their expected labels (see Sample data) are the worked examples.
+
+## Weaknesses
+
+- The model-set part of `flagged` comes from the model the attacker is addressing, so a successful injection can switch it off. Only the quote check is out of the attacker's reach.
+- The quote check catches the planted phrase in t-1005 exactly, but it is easy to evade by paraphrasing, changing a word or not using quotes.
+- Separation of instructions and data reduces the success rate of an injection but does not prevent it; a model that obeys anyway is caught, if at all, by the output checks.
+- Processing is at-least-once: after a crash or an expired lease the model can be called twice for one ticket, although only one result is stored.
+- The startup claim reset assumes a single process: a second instance on the same database would wipe the first one's live claims. Running two instances would need lease expiry only.
+- The one-sentence rule for summaries is a heuristic: an abbreviation such as "Mr. Smith" trips it and costs a retry.
+- Priorities are judgment calls and depend on the rubric; the expected labels are worked examples, not ground truth.
+- SQLite allows one writer at a time, so claims, result writes and ingest serialise and throughput is bounded by statement latency, not by `WORKER_COUNT`.
+
+Ticket lifecycle, Model output validation and Prompt injection each end with a Known limits list that has further detail.
+
+## With more time
+
+- Graceful shutdown: stop claiming, let in-flight attempts finish under a deadline, then cancel. Today `WorkerPool.stop` in `app/worker.py` cancels at once and the claim reset or lease expiry recovers the tickets.
+- A small evaluation script over the labelled fixture: run `data/sample_tickets.json` through an `LLMClient` and report agreement with `data/expected_labels.json` per ticket and field, plus attempts and flags. Today `tests/test_sample_data.py` checks the same labels, with the fake only.
+- A real provider behind the `LLMClient` protocol in `app/llm/base.py`, mapping its errors to `LLMTimeout` and `LLMUnavailable` and reading its key from the environment. `create_app` in `app/main.py` already accepts any `LLMClient`; the fake stays the default.
+- Metrics: attempts per outcome and code, attempt latency, queue depth and flagged rate on a `/metrics` endpoint. Today the per-attempt log line is the only signal.
+- Wake the workers on ingest and on requeue instead of polling every `POLL_INTERVAL_S`.
+- A nonce on the inner `<subject>` and `<body>` tags as well as the outer one.
+- A lease-only mode, without the startup claim reset, so that several processes can share one database.
 
 ## Configuration
 
@@ -374,7 +451,7 @@ The app refuses to start, naming the variable, when a value is malformed, not fi
 | `BACKOFF_BASE_S` | 0 to 86400 |
 | `FAKE_LLM_FAILURE_RATE` | 0 to 1 |
 | `FAKE_LLM_SEED` | at most 18 digits |
-| `DB_PATH` | not blank |
+| `DB_PATH` | not blank, not `:memory:` |
 
 ## Layout
 
@@ -398,6 +475,15 @@ data/
   sample_tickets.json   The ten sample tickets as POST /tickets payloads
   expected_labels.json  Their expected category, priority and flag
 tests/
+  conftest.py     Fixtures: fake clock, settings, app, TestClient, database, repository
+  sample_data.py  Loads the files in data/ for the tests
+  workers.py      Helpers for tests that run the real worker pool
+  test_*.py       test_app, test_config, test_clock, test_db, test_repository, test_worker,
+                  test_classifier, test_prompt, test_validation, test_llm_fake, test_seed;
+                  the API in test_ingest, test_read_api, test_reclassify;
+                  test_sample_data (sample run, labels table), test_readme (this file)
+.gitattributes    LF line endings for every text file (the Makefile needs them)
+.gitignore
 .python-version
 pyproject.toml
 uv.lock
