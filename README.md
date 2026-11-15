@@ -204,8 +204,8 @@ app/
   classifier.py   One classification attempt                    (planned)
   prompt.py       System prompt, PROMPT_VERSION, ticket wrapping (planned)
   validation.py   Model text to typed result or typed rejection (planned)
-  llm/base.py     LLMClient protocol and error types            (planned)
-  llm/fake.py     Deterministic fake                            (planned)
+  llm/base.py     LLMClient protocol and error types
+  llm/fake.py     Deterministic fake
   seed.py         Loads the sample tickets                      (planned)
 data/                                                            (planned)
   sample_tickets.json
