@@ -51,7 +51,10 @@ def create_app(
         log.info("starting with %s", settings)
         db.create_schema()
         log.info("schema ready at %s", db.path)
-        # #8: clear stale claims before workers start
+        # The previous process is gone, so its leases are released now rather than after LEASE_TIMEOUT_S.
+        # Before the workers start: a claim taken by a worker of this process must never be wiped.
+        released = repository.release_all_claims()
+        log.info("released %d claim(s) left by the previous run", released)
         await workers.start()
         try:
             yield

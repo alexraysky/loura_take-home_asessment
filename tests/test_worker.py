@@ -297,7 +297,7 @@ async def test_backoff_base_zero_retries_immediately(repository, settings):
 async def test_attempts_exhausted_without_a_model_call(repository, db, settings, caplog):
     caplog.set_level(logging.INFO, logger="app.worker")
     repository.insert_ticket("t-1001", *T1001)
-    # A previous worker died holding the last attempt; its claim was cleared (lease expiry or #8).
+    # A previous worker died holding the last attempt; its claim was cleared (lease expiry or the startup reset).
     set_columns(db, "t-1001", attempts=settings.max_attempts, flagged=1, flag_reason=FLAG_REASON_ECHO)
     fake = honest()
     processed = await make_worker(repository, fake, settings).process_one()
@@ -337,6 +337,52 @@ async def test_stale_workers_write_is_ignored(repository, settings, clock, caplo
     [stale] = [r for r in worker_records(caplog) if "worker-a" in r.getMessage()]
     assert stale.levelno == logging.WARNING
     assert "attempt 1/3 -> stale: claim lost before classified" in stale.getMessage()
+
+
+async def test_three_crashes_end_attempts_exhausted_without_a_model_call(repository, db, settings, caplog):
+    caplog.set_level(logging.INFO, logger="app.worker")
+    repository.insert_ticket("t-1001", *T1001)
+    set_columns(db, "t-1001", flagged=1, flag_reason=FLAG_REASON_ECHO)
+    for attempts in range(1, settings.max_attempts + 1):
+        # The process dies holding the claim; the next start releases it.
+        assert repository.claim_next(lease_timeout_s=settings.lease_timeout_s).attempts == attempts
+        assert repository.release_all_claims() == 1
+    fake = honest()
+    processed = await make_worker(repository, fake, settings).process_one()
+    assert processed == Processed("t-1001", 4, Outcome.FAILED, "attempts_exhausted")
+    assert fake.calls == []
+    stored = repository.get_ticket("t-1001")
+    assert (stored.status, stored.last_error, stored.attempts, stored.claimed_at) == (
+        "failed",
+        "attempts_exhausted",
+        4,
+        None,
+    )
+    assert (stored.flagged, stored.flag_reason) == (True, FLAG_REASON_ECHO)
+
+
+async def test_expired_lease_is_taken_by_another_worker_while_running(repository, settings, clock):
+    repository.insert_ticket("t-1001", *T1001)
+    gate = GateLLM()  # never released: worker A hangs on its model call
+    a = make_worker(repository, gate, settings, name="worker-a")
+    b = make_worker(repository, honest(), settings, name="worker-b")
+    task = asyncio.create_task(a.process_one())
+    await gate.wait_parked(1)
+    token_a = repository.get_ticket("t-1001").claimed_at
+    assert await b.process_one() is None  # A's lease is live
+    clock.advance(settings.lease_timeout_s + 1)
+    token_b = format_ts(clock())
+    assert token_b != token_a
+    assert await b.process_one() == Processed("t-1001", 2, Outcome.CLASSIFIED, None)
+    won = repository.get_ticket("t-1001")
+    assert (won.status, won.attempts, won.claimed_at) == ("classified", 2, None)
+    assert repository.finish_failed("t-1001", token=token_a, code="llm_timeout") is False
+    assert repository.get_ticket("t-1001") == won
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert gate.parked == 1
+    assert repository.get_ticket("t-1001") == won
 
 
 async def test_concurrent_workers_claim_distinct_tickets(repository, db, settings, clock):
