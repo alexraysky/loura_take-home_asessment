@@ -2253,3 +2253,29 @@ def test_account_access_blocker_gets_the_lockout_summary():
     answer = classify_text("", "I cannot log in to my account.")
     assert (answer["category"], answer["priority"]) == ("account", "medium")
     assert answer["summary"] == "Customer cannot access their account and needs it restored."
+
+
+@pytest.mark.parametrize(
+    ("subject", "body", "expected"),
+    [
+        ("API is down", "It is fixed now.", ("technical", "low")),
+        ("", "The export fails. It is fixed now.", ("technical", "low")),
+        ("Export fails", "The export is fixed now.", ("technical", "low")),
+        ("Cannot log in", "Never mind, it works now.", ("account", "low")),
+    ],
+)
+def test_present_recovery_closes_an_earlier_active_state_problem(subject, body, expected):
+    answer = classify_text(subject, body)
+    assert (answer["category"], answer["priority"]) == expected
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        "The API is down again. It was fixed yesterday.",
+        "The API is still down, although it was fixed this morning.",
+    ],
+)
+def test_past_or_concessive_recovery_keeps_an_active_state_problem(body):
+    answer = classify_text("", body)
+    assert (answer["category"], answer["priority"]) == ("technical", "high")

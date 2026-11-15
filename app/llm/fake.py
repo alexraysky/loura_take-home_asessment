@@ -717,6 +717,9 @@ _TARGET_LEADING = frozenset(
     "and so then also now actually update edit the a an my our your their this that these those".split()
 )
 _TARGET_TRAILING = frozenset("is are was were has have had been got seem seems 's 're".split())
+# A concessive recovery grants a past fix without retracting the problem before it: "The API is
+# still down, although it was fixed this morning." Matched from the clause start.
+_CONCESSIVE_RE = re.compile(r"\s*(?:although|even though|though|while|whereas)(?!\w)")
 # Concrete problem wording in a clause. A clause without any ("Following up: the export is fixed
 # now.") only leads up to a later resolution, so it goes with it.
 _CONCRETE_PROBLEM_RE = re.compile(
@@ -1170,8 +1173,10 @@ def _drop_sentences(sentences: list[str], *, drop_past: bool) -> list[str]:
     a subject that problem names too, across a sentence boundary as well: "The API was down. It is
     fixed now." A clause kept in an earlier sentence ends its reach. With ``drop_past`` the clauses
     that only tell of a past problem go too, unless a later anaphoric clause denies its recovery. A
-    clause that says the problem goes on, states a present problem or imagines one is always kept. A
-    sentence with nothing left is "".
+    clause that imagines a problem is always kept, and one that says it goes on or states a present
+    problem is kept unless a present recovery closes it: "API is down. It is fixed now." A concessive
+    recovery ("although it was fixed this morning") closes nothing. A sentence with nothing left is
+    "".
     """
     # "The export was fixed yesterday, but we found a security breach." still reports the breach,
     # "I was charged twice. It was refunded." leaves nothing owed and "I was charged twice. My
@@ -1181,6 +1186,9 @@ def _drop_sentences(sentences: list[str], *, drop_past: bool) -> list[str]:
     # The clauses of every sentence, flattened so one pass carries a recovery across sentences.
     clauses: list[tuple[str, str]] = []
     owner: list[int] = []
+    # A hypothetical clause imagines its problem, so nothing resolves it; a held one (hypothetical,
+    # ongoing or a present state) is kept unless a present recovery closes it.
+    hypothetical: list[bool] = []
     held: list[bool] = []
     bounds: list[tuple[int, int]] = []
     for index, sentence in enumerate(sentences):
@@ -1191,16 +1199,19 @@ def _drop_sentences(sentences: list[str], *, drop_past: bool) -> list[str]:
             clause = sentence[start : separator.start() if separator else len(sentence)]
             clauses.append((sep_before, clause))
             owner.append(index)
-            held.append(bool(cues.search(clause) or _ONGOING_RE.search(clause) or _ACTIVE_STATE_RE.search(clause)))
+            hypothetical.append(bool(cues.search(clause)))
+            held.append(hypothetical[-1] or bool(_ONGOING_RE.search(clause) or _ACTIVE_STATE_RE.search(clause)))
             if separator is None:
                 break
             sep_before, start = separator.group(), separator.end()
         bounds.append((first, len(clauses)))
     # One pass from the end: later says a resolution follows, target what the nearest one still
-    # closes ("*" for an anaphoric subject) with no clause naming a problem in between, and persists
-    # the same for a denied recovery.
+    # closes ("*" for an anaphoric subject) with no clause naming a problem in between, present_reach
+    # that its recovery is present ("API is down. It is fixed now.") and so closes a held problem
+    # too, unlike a past one ("The API is down again. It was fixed yesterday."), and persists the
+    # same for a denied recovery.
     dropped = [False] * len(clauses)
-    later = persists = False
+    later = persists = present_reach = False
     target: str | None = None
     resolved_in = -1
     for i in range(len(clauses) - 1, -1, -1):
@@ -1219,21 +1230,27 @@ def _drop_sentences(sentences: list[str], *, drop_past: bool) -> list[str]:
             and target is not None
             and (target == "*" or re.search(rf"(?<!\w){re.escape(target)}(?!\w)", clause) is not None)
         )
-        dropped[i] = not held[i] and (
-            resolved
-            or (later and (preamble or closes))
-            or (drop_past and not persists and _PAST_RE.search(clause) is not None)
+        dropped[i] = (not hypothetical[i] and later and closes and (not held[i] or present_reach)) or (
+            not held[i]
+            and (
+                resolved
+                or (later and preamble)
+                or (drop_past and not persists and _PAST_RE.search(clause) is not None)
+            )
         )
         if resolved:
-            later, resolved_in = True, owner[i]
-            closed = _resolution_target(clause)
-            if target is None or closed == "*":
-                target = closed
+            # A concessive recovery goes itself but reaches back to close nothing.
+            if not _CONCESSIVE_RE.match(clause):
+                later, resolved_in = True, owner[i]
+                closed = _resolution_target(clause)
+                if target is None or closed == "*":
+                    target = closed
+                    present_reach = _PAST_RE.search(clause) is None
         else:
             if problem:
-                target = None
+                target, present_reach = None, False
             if crossed and not dropped[i]:
-                later, target = False, None
+                later, target, present_reach = False, None, False
         if held[i] and _ANAPHORIC_DENIED_RE.match(clause):
             persists = True
         elif problem:
