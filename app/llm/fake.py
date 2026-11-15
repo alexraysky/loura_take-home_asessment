@@ -440,7 +440,8 @@ _RESOLVED_RE = _cues(
     r"(?:is|are|'s|'re|came|come|comes|went) back (?:up|online|to normal)",
     r"back to normal",
     r"no longer (?:down|broken|failing|crashing|offline|unavailable|locked out|blocked|degraded|slow"
-    r"|timing out|affected|impacted|an issue|a problem|happening|occurring)",
+    r"|timing out|affected|impacted|an issue|a problem|happening|occurring|blocking|empty)",
+    r"(?:is|are|'s|'re) not empty anymore",
 )
 # A present-tense problem state is going on now, whatever past change caused it: "Our API is down
 # after last week's release.", "All users are locked out after last week's upgrade.", "Login was
@@ -726,7 +727,7 @@ _ANAPHORIC_DENIED_RE = re.compile(
     + _cues(
         *_DENIED_RECOVERY,
         r"(?:is|are|'s|'re|has been|have been|'ve been) still (?:down|broken|unavailable|failing|crashing"
-        r"|offline|locked out|blocked|degraded|slow|timing out|unreachable|inaccessible)",
+        r"|offline|locked out|blocked|blocking|degraded|slow|timing out|unreachable|inaccessible|empty)",
     ).pattern
 )
 # Words around the named subject of a resolution: "Update: the export is fixed now." names "export".

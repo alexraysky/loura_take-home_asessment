@@ -1252,6 +1252,35 @@ def test_empty_results_blocking_and_rejected_credentials_are_blockers(subject, b
 
 
 @pytest.mark.parametrize(
+    "body",
+    [
+        "The export was empty, but it is no longer empty.",
+        "The export was empty, but it is not empty anymore.",
+        "The export is blocking our job, but it is no longer blocking our job.",
+        "Our export is blocking payroll. It is no longer blocking.",
+    ],
+)
+def test_resolved_empty_or_blocking_reports_stay_low(body):
+    answer = classify_text("", body)
+    assert (answer["category"], answer["priority"]) == ("technical", "low")
+    assert answer["summary"] == "Customer asks a technical question with no time pressure."
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        "The export was empty. It is still empty.",
+        "The export was empty. It is still blocking our job.",
+        "The export was empty, but it is not fixed.",
+    ],
+)
+def test_ongoing_empty_or_blocking_reports_stay_blockers(body):
+    answer = classify_text("", body)
+    assert (answer["category"], answer["priority"]) == ("technical", "medium")
+    assert answer["summary"] == "Customer reports an error that blocks their work."
+
+
+@pytest.mark.parametrize(
     ("body", "category", "priority"),
     [
         ("Even if I reset my password I can't log in.", "account", "medium"),

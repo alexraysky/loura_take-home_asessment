@@ -504,6 +504,57 @@ def test_output_never_contains_ticket_text_or_response_message(capsys, server, t
     assert out.splitlines()[:2] == ["t-1 409 Conflict (ticket_conflict)", "t-1 500 Internal Server Error"]
 
 
+HOSTILE_ID = "t-1\n9999 202 Accepted\rforged\x1b[2J\u2028end"
+HOSTILE_SHOWN = r"t-1\n9999 202 Accepted\rforged\x1b[2J\u2028end"
+
+
+def assert_no_raw_control(text: str) -> None:
+    assert "\r" not in text
+    assert "\x1b" not in text
+    assert "\u2028" not in text
+
+
+def test_hostile_id_is_sent_raw_but_printed_escaped(capsys, server, tmp_path):
+    server.reply(Reply(422, envelope("validation_error")), Reply(202))
+    entries = [{"id": HOSTILE_ID, "body": "x"}, {"id": HOSTILE_ID, "body": "y"}]
+    code, out, err = run_seed(capsys, "--base-url", server.base_url, "--file", str(tickets_file(tmp_path, entries)))
+    assert code == 1
+    assert [json.loads(r.body)["id"] for r in server.received] == [HOSTILE_ID, HOSTILE_ID]
+    assert_no_raw_control(out + err)
+    # The echo carries the raw id, so the 202 still counts as accepted.
+    assert out.splitlines() == [
+        f"{HOSTILE_SHOWN} 422 Unprocessable Content (validation_error)",
+        f"{HOSTILE_SHOWN} 202 Accepted",
+        "2 tickets: 1 accepted, 0 already stored, 1 other",
+    ]
+
+
+def test_hostile_id_is_escaped_when_unreachable(capsys, tmp_path):
+    base = f"http://127.0.0.1:{closed_port()}"
+    path = str(tickets_file(tmp_path, [{"id": HOSTILE_ID, "body": "x"}]))
+    code, out, err = run_seed(capsys, "--base-url", base, "--file", path, "--timeout", "2")
+    assert code == 1
+    assert_no_raw_control(out + err)
+    [line] = out.splitlines()
+    assert line.startswith(f"{HOSTILE_SHOWN} error: could not reach {base} (")
+
+
+def test_format_line_escapes_the_id():
+    outcome = seed.Outcome("bad\nid\x1b[2J", 422, "Unprocessable Content", "validation_error")
+    assert seed.format_line(outcome) == r"bad\nid\x1b[2J 422 Unprocessable Content (validation_error)"
+
+
+@pytest.mark.parametrize("text", ["t-1001", "tické-日本", "a b"])
+def test_escape_display_leaves_printable_text(text):
+    assert seed.escape_display(text) == text
+
+
+def test_escape_display_escapes_every_control_character():
+    shown = seed.escape_display("\x00\t\n\r\x1b\x7f\x85\u200b\u2028\u2029")
+    assert shown == r"\x00\t\n\r\x1b\x7f\x85\u200b\u2028\u2029"
+    assert shown.isascii() and shown.isprintable()
+
+
 # G. Real round trip and entry point
 
 

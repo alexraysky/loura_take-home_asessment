@@ -18,6 +18,7 @@ import json
 import math
 import re
 import sys
+import unicodedata
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -242,8 +243,23 @@ def _error_code(data: Any) -> str | None:
     return code if isinstance(code, str) and _CODE_RE.fullmatch(code) else None
 
 
+def escape_display(text: str) -> str:
+    """``text`` with control, format and line or paragraph separator characters backslash-escaped.
+
+    A ticket id from a custom file goes to the server as is, but a newline or an ANSI escape in it
+    must not forge output lines or drive the terminal, so a newline prints as the two characters
+    backslash and n. Printable text, non-ASCII letters included, is left as it is.
+    """
+    return "".join(ch.encode("unicode_escape").decode("ascii") if _is_unsafe(ch) else ch for ch in text)
+
+
+def _is_unsafe(ch: str) -> bool:
+    category = unicodedata.category(ch)
+    return category[0] == "C" or category in ("Zl", "Zp")
+
+
 def format_line(outcome: Outcome) -> str:
-    line = f"{outcome.id} {outcome.status} {outcome.reason}".rstrip()
+    line = f"{escape_display(outcome.id)} {outcome.status} {outcome.reason}".rstrip()
     if outcome.kind == "stored":
         return f"{line} (already stored)"
     if outcome.kind == "other" and outcome.status in (HTTPStatus.ACCEPTED, HTTPStatus.OK):
@@ -261,7 +277,8 @@ def run(tickets: Sequence[dict[str, str]], base_url: str, *, timeout: float, out
             outcome = post_ticket(base_url, ticket, timeout=timeout)
         except Unreachable as exc:
             # A server that is down stays down: stop rather than wait out a timeout per ticket.
-            print(f"{ticket['id']} error: could not reach {base_url} ({exc.reason})", file=out)
+            target = f"{escape_display(ticket['id'])} error: could not reach {escape_display(base_url)}"
+            print(f"{target} ({exc.reason})", file=out)
             print("seed: is the server running? try: make run", file=err)
             return EXIT_FAILED
         counts[outcome.kind] += 1
