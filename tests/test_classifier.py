@@ -125,6 +125,13 @@ async def test_deadline_timeout_is_llm_timeout():
     assert slow.cancelled is True
 
 
+async def test_builtin_timeout_error_from_the_client_is_a_client_timeout():
+    # A client raising the built-in TimeoutError (a socket timeout, say) gave up itself; the deadline did not.
+    attempt = await classify_once(RaisingLLM(TimeoutError("socket")), *T1001, timeout_s=TIMEOUT_S)
+    assert attempt.code == "llm_timeout"
+    assert attempt.timed_out_by == "client"
+
+
 async def test_base_llm_error_is_llm_error():
     attempt = await classify_once(RaisingLLM(LLMError("x")), *T1001, timeout_s=TIMEOUT_S)
     assert attempt.code == "llm_error"

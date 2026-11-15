@@ -191,15 +191,16 @@ class Repository:
         _check_code(code)
         if not delay_s >= 0:
             raise ValueError(f"delay_s must be 0 or greater, got {delay_s!r}")
-        next_attempt_at = format_ts(self._clock() + timedelta(seconds=delay_s))
+        now = self._clock()  # one read: updated_at and next_attempt_at are delay_s apart exactly
         return self._finish(
             _RETRY_SQL,
             id,
             token,
             flagged=sets_flag,
+            now=format_ts(now),
             flag_reason=flag_reason,
             code=code,
-            next_attempt_at=next_attempt_at,
+            next_attempt_at=format_ts(now + timedelta(seconds=delay_s)),
         )
 
     def finish_failed(
@@ -215,9 +216,12 @@ class Repository:
         _check_code(code)
         return self._finish(_FAILED_SQL, id, token, flagged=sets_flag, flag_reason=flag_reason, code=code)
 
-    def _finish(self, sql: str, id: str, token: str, *, flagged: bool, **params: object) -> bool:
+    def _finish(
+        self, sql: str, id: str, token: str, *, flagged: bool, now: str | None = None, **params: object
+    ) -> bool:
         # int(): the flag merge relies on a 0/1 binding, never NULL.
-        params |= {"id": id, "token": token, "flagged": int(bool(flagged)), "now": self._now()}
+        now = self._now() if now is None else now
+        params |= {"id": id, "token": token, "flagged": int(bool(flagged)), "now": now}
         with self._db.connection() as conn:
             return conn.execute(sql, params).rowcount == 1
 

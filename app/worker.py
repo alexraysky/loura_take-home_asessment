@@ -5,13 +5,16 @@ so SQLite never blocks the event loop. ``process_one`` is the whole loop body, s
 step by step with a scripted fake and a fake clock.
 
 Log lines carry the worker name, the ticket id, the attempt number and codes; never the subject,
-the body, the prompt or the model's text.
+the body, the prompt or the model's text. An unexpected exception is logged as its type names and
+stack frames only, with every message in its chain omitted: a client's or SDK's error message can
+echo the prompt (the ticket) or the model's response.
 """
 
 import asyncio
 import logging
 import random
 import time
+import traceback
 from dataclasses import dataclass
 from enum import StrEnum
 
@@ -47,6 +50,57 @@ def compute_backoff_s(backoff_base_s: float, attempts: int, rng: random.Random =
     if attempts < 1:
         raise ValueError(f"attempts must be at least 1, got {attempts}")
     return backoff_base_s * 2 ** (attempts - 1) + rng.random() * backoff_base_s
+
+
+_CAUSE = "The above exception was the direct cause of the following exception:"
+_CONTEXT = "During handling of the above exception, another exception occurred:"
+
+
+def format_sanitized_traceback(exc: BaseException) -> str:
+    """A traceback of ``exc`` and its chain with every exception message left out.
+
+    Each exception contributes its stack frames (file, line, function and the source line read from
+    the ``.py`` file) and its type name; ``str()`` and ``repr()`` of an exception are never taken.
+    Causes, unsuppressed contexts and exception group members are walked as the interpreter does,
+    and a cycle in the chain is cut.
+    """
+    lines: list[str] = []
+    _format_chain(exc, set(), "", lines)
+    return "\n".join(lines)
+
+
+def _format_chain(exc: BaseException, seen: set[int], indent: str, lines: list[str]) -> None:
+    chain: list[tuple[BaseException, str | None]] = []  # outermost first, each with its link to the previous
+    current: BaseException | None = exc
+    link: str | None = None
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        chain.append((current, link))
+        if current.__cause__ is not None:
+            current, link = current.__cause__, _CAUSE
+        elif current.__context__ is not None and not current.__suppress_context__:
+            current, link = current.__context__, _CONTEXT
+        else:
+            current = None
+    # Innermost first, like the interpreter; a link sits between an exception and the one it led to.
+    for i in range(len(chain) - 1, -1, -1):
+        e, link = chain[i]
+        if e.__traceback__ is not None:
+            lines.append(f"{indent}Traceback (most recent call last):")
+            for frame in traceback.format_list(traceback.extract_tb(e.__traceback__)):
+                lines.extend(indent + line for line in frame.rstrip("\n").split("\n"))
+        lines.append(f"{indent}{_type_name(e)} (message omitted)")
+        if isinstance(e, BaseExceptionGroup):
+            for j, member in enumerate(e.exceptions, 1):
+                lines.append(f"{indent}+-- member {j} of {len(e.exceptions)}")
+                _format_chain(member, seen, indent + "  | ", lines)
+        if link is not None:
+            lines.extend(["", indent + link, ""])
+
+
+def _type_name(exc: BaseException) -> str:
+    cls = type(exc)
+    return cls.__qualname__ if cls.__module__ == "builtins" else f"{cls.__module__}.{cls.__qualname__}"
 
 
 class Worker:
@@ -86,8 +140,15 @@ class Worker:
         attempt: Attempt | None
         try:
             attempt = await classify_once(self._llm, ticket.subject, ticket.body, timeout_s=s.llm_timeout_s)
-        except Exception:
-            log.exception("%s: %s attempt %d/%d raised", self.name, ticket.id, n, s.max_attempts)
+        except Exception as exc:
+            log.error(
+                "%s: %s attempt %d/%d raised\n%s",
+                self.name,
+                ticket.id,
+                n,
+                s.max_attempts,
+                format_sanitized_traceback(exc),
+            )
             attempt = None
 
         if attempt is not None and attempt.accepted is not None:
@@ -131,10 +192,10 @@ class Worker:
             while True:
                 try:
                     processed = await self.process_one()
-                except Exception:
+                except Exception as exc:
                     # sqlite3.Error (e.g. "database is locked") and anything else; CancelledError passes.
                     # A ticket whose finish write failed keeps its claim and is recovered by lease expiry.
-                    log.exception("%s: iteration failed", self.name)
+                    log.error("%s: iteration failed\n%s", self.name, format_sanitized_traceback(exc))
                     processed = None
                 if processed is None:
                     await asyncio.sleep(self._settings.poll_interval_s)

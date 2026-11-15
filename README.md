@@ -188,12 +188,12 @@ Each attempt builds a fresh prompt, calls the model under `LLM_TIMEOUT_S` and ha
 | `llm_unavailable` | The model could not be reached or refused the request |
 | `llm_error` | Any other client error |
 | `response_too_large`, `not_json`, `schema_violation`, `value_out_of_set`, `summary_invalid`, `summary_echoes_ticket` | Output validation rejected the answer (see below) |
-| `unexpected_error` | Any other exception during the attempt (a client bug, non-text output); logged with a traceback |
+| `unexpected_error` | Any other exception during the attempt (a client bug, non-text output); logged with a sanitized traceback (see below) |
 | `attempts_exhausted` | The ticket was claimed with no attempts left (terminal, no model call) |
 
 Every finishing write is guarded by `WHERE id = ? AND status = 'pending' AND claimed_at = <the claim's timestamp>`, so a worker whose lease expired cannot overwrite the result of the worker that took over; its write matches no row and is logged as `stale`. `flagged` only ever goes up and the first `flag_reason` written is kept, on every outcome: the quote check's flag from a rejected attempt survives a later honest answer or a `failed` ending. Sample ticket t-1005 therefore ends `billing`/`low` with `flagged` true and reason `summary echoed quoted ticket text`, even though the accepted answer carried a reason of its own.
 
-Each finished attempt logs one line with the worker, the ticket id, the attempt number, the outcome, the code, the prompt version, whether the body was truncated and the duration, for example `worker-0: t-1005 attempt 1/3 -> retry (summary_echoes_ticket) prompt=v1 truncated=false 0.004s`. Ticket text, prompts and model text are never logged.
+Each finished attempt logs one line with the worker, the ticket id, the attempt number, the outcome, the code, the prompt version, whether the body was truncated and the duration, for example `worker-0: t-1005 attempt 1/3 -> retry (summary_echoes_ticket) prompt=v1 truncated=false 0.004s`. Ticket text, prompts and model text are never logged. An unexpected exception, in an attempt or anywhere in the worker loop, is logged at ERROR as the type names and stack frames of the exception and of its chained causes, contexts and group members, with every exception message omitted (`ValueError (message omitted)`): a client or SDK error message can echo the prompt (the ticket) or the model's response, so it never reaches the log.
 
 On shutdown the worker tasks are cancelled. A ticket in flight keeps its claim and is picked up again once its lease expires; a write already running completes. Processing is therefore at-least-once: the model may be called twice for one ticket, but only one result is stored.
 
@@ -206,6 +206,7 @@ Known limits:
 - SQLite has one writer at a time: claims, results and ingest serialise, so throughput is bounded by statement latency, not by `WORKER_COUNT`.
 - A deterministic client bug costs `MAX_ATTEMPTS` model calls per ticket before it fails.
 - `last_error` holds only the last attempt's code; earlier attempts are in the logs. Truncation is logged, not stored.
+- Unexpected exceptions are logged without their messages, so a log alone does not say why a client or the database failed, only where and with which exception type. Stack frames show source lines from the `.py` files, never variable values.
 
 ## Model output validation
 

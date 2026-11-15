@@ -54,12 +54,23 @@ async def classify_once(llm: LLMClient, subject: str, body: str, *, timeout_s: f
     a prompt builder error) propagates, and so does cancellation.
     """
     prompt = build_prompt(subject, body)  # a fresh nonce per attempt
+    client_timed_out = False
+
+    async def call() -> str:
+        # wait_for raises the same TimeoutError when its deadline expires, so note who raised it.
+        nonlocal client_timed_out
+        try:
+            return await llm.complete(prompt.system, prompt.user)
+        except TimeoutError:
+            client_timed_out = True
+            raise
+
     try:
-        text = await asyncio.wait_for(llm.complete(prompt.system, prompt.user), timeout_s)
+        text = await asyncio.wait_for(call(), timeout_s)
     except LLMTimeout:
         return _error("llm_timeout", prompt, timed_out_by="client")
     except TimeoutError:
-        return _error("llm_timeout", prompt, timed_out_by="deadline")
+        return _error("llm_timeout", prompt, timed_out_by="client" if client_timed_out else "deadline")
     except LLMUnavailable:
         return _error("llm_unavailable", prompt)
     except LLMError:

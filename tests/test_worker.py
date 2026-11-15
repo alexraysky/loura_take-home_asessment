@@ -18,7 +18,7 @@ from app.llm.fake import FLAG_REASON_INJECTION, HIJACKED_ANSWER, classify_text
 from app.prompt import MAX_BODY_CHARS, SYSTEM_PROMPT
 from app.repository import Repository
 from app.validation import FLAG_REASON_ECHO
-from app.worker import Outcome, Processed, Worker, WorkerPool, compute_backoff_s
+from app.worker import Outcome, Processed, Worker, WorkerPool, compute_backoff_s, format_sanitized_traceback
 
 # Approximations of the appendix tickets, as in tests/test_prompt.py.
 T1001 = (
@@ -33,6 +33,8 @@ T1005 = (
 )
 ATTACKER_SUMMARY = HIJACKED_ANSWER["summary"]
 DEADLINE_S = 5.0
+WORKER_FRAME_RE = re.compile(r'File ".*app[\\/]worker\.py", line \d+, in process_one')
+CLASSIFIER_FRAME_RE = re.compile(r'File ".*app[\\/]classifier\.py", line \d+, in classify_once')
 
 
 class GateLLM:
@@ -369,8 +371,11 @@ async def test_unexpected_exception_is_a_retry_with_a_traceback(repository, sett
         "t-1001", 1, Outcome.RETRY, "unexpected_error"
     )
     [error] = [r for r in worker_records(caplog) if r.levelno == logging.ERROR]
-    assert error.exc_info is not None and error.exc_info[0] is RuntimeError
-    assert "t-1001 attempt 1/3 raised" in error.getMessage()
+    message = error.getMessage()
+    assert error.exc_info is None  # the formatter would print the message
+    assert message.startswith("worker-0: t-1001 attempt 1/3 raised\nTraceback (most recent call last):\n")
+    assert WORKER_FRAME_RE.search(message) and CLASSIFIER_FRAME_RE.search(message)
+    assert message.endswith("\nRuntimeError (message omitted)")
     stored = repository.get_ticket("t-1001")
     assert (stored.status, stored.last_error, stored.claimed_at) == ("pending", "unexpected_error", None)
     assert stored.next_attempt_at == format_ts(clock() + timedelta(seconds=1))
@@ -382,7 +387,8 @@ async def test_non_str_model_output_is_unexpected_error(repository, settings, ca
     repository.insert_ticket("t-1001", *T1001)
     processed = await make_worker(repository, BytesLLM(), settings).process_one()
     assert processed == Processed("t-1001", 1, Outcome.RETRY, "unexpected_error")
-    assert any(r.exc_info and r.exc_info[0] is TypeError for r in worker_records(caplog))
+    [error] = [r for r in worker_records(caplog) if r.levelno == logging.ERROR]
+    assert error.getMessage().endswith("\nTypeError (message omitted)")
 
 
 async def test_unexpected_error_on_the_last_attempt_fails(repository, db, settings):
@@ -536,6 +542,125 @@ async def test_logs_never_contain_ticket_or_model_text(repository, settings, clo
     assert "t-1005 attempt 2/3 -> classified prompt=v1" in text
 
 
+SECRET_TICKET = ("SUBJ-SECRET-zzq", "BODY-SECRET-qqz: please refund my card")
+RAW_RESPONSE = '{"category": "billing", "priority": "low", "summary": "MODEL-SECRET-kkw"}'
+LEAKS = [*SECRET_TICKET, "MODEL-SECRET-kkw", "<ticket-", "<subject>", "<body>", SYSTEM_PROMPT[:40]]
+
+
+class PromptInMessageLLM:
+    """An SDK-style client whose errors echo the request or the response."""
+
+    def __init__(self, how: str) -> None:
+        self.how = how
+
+    async def complete(self, system: str, user: str) -> str:
+        await asyncio.sleep(0)
+        if self.how == "prompt":
+            raise ValueError(user)
+        if self.how == "response":
+            raise RuntimeError(f"raw model response: {RAW_RESPONSE}")
+        if self.how == "explicit":
+            raise RuntimeError("wrapper") from KeyError(user)
+        if self.how == "implicit":
+            try:
+                raise ValueError(user)
+            except ValueError:
+                raise RuntimeError(f"system was {system}")  # no "from": the implicit chain is the point
+        if self.how == "group":
+            raise ExceptionGroup(user, [ValueError(user), LookupError(RAW_RESPONSE)])
+        raise AssertionError(self.how)
+
+
+@pytest.mark.parametrize(
+    "how, types",
+    [
+        ("prompt", ["ValueError"]),
+        ("response", ["RuntimeError"]),
+        ("explicit", ["KeyError", "RuntimeError"]),
+        ("implicit", ["ValueError", "RuntimeError"]),
+        ("group", ["ExceptionGroup", "ValueError", "LookupError"]),
+    ],
+)
+async def test_unexpected_exception_messages_are_never_logged(repository, settings, caplog, how, types):
+    caplog.set_level(logging.DEBUG)
+    repository.insert_ticket("t-1001", *SECRET_TICKET)
+    processed = await make_worker(repository, PromptInMessageLLM(how), settings).process_one()
+    assert processed == Processed("t-1001", 1, Outcome.RETRY, "unexpected_error")
+    [error] = [r for r in worker_records(caplog) if r.levelno == logging.ERROR]
+    message = error.getMessage()
+    assert error.exc_info is None
+    assert WORKER_FRAME_RE.search(message) and CLASSIFIER_FRAME_RE.search(message)
+    assert re.findall(r"(\w+) \(message omitted\)", message) == types
+    if how == "explicit":
+        assert "The above exception was the direct cause of the following exception:" in message
+    if how == "implicit":
+        assert "During handling of the above exception, another exception occurred:" in message
+    for leak in LEAKS:
+        assert leak not in caplog.text
+    assert repository.get_ticket("t-1001").last_error == "unexpected_error"
+
+
+class LeakyFinishRepository:
+    """Its classified write fails with an error that quotes the ticket and the model's summary."""
+
+    def __init__(self, inner) -> None:
+        self.inner = inner
+
+    def finish_classified(self, id, *, result, **kwargs):
+        ticket = self.inner.get_ticket(id)
+        raise sqlite3.IntegrityError(f"cannot store {ticket.subject!r} / {ticket.body!r}: {result.summary!r}")
+
+    def __getattr__(self, name):
+        return getattr(self.inner, name)
+
+
+async def test_run_never_logs_a_repository_error_message(repository, settings, caplog):
+    caplog.set_level(logging.DEBUG)
+    repository.insert_ticket("t-1001", *SECRET_TICKET)
+    summary = "MODEL-SECRET-kkw summary"
+    answer = {"category": "billing", "priority": "low", "summary": summary, "flagged": False, "flag_reason": None}
+    llm = AnswerLLM(json.dumps(answer))
+    task = asyncio.create_task(
+        make_worker(LeakyFinishRepository(repository), llm, replace(settings, poll_interval_s=0.001)).run()
+    )
+    try:
+        async with asyncio.timeout(DEADLINE_S):
+            while not any(r.levelno == logging.ERROR for r in worker_records(caplog)):
+                await asyncio.sleep(0.001)
+    finally:
+        await stop(task)
+    error = next(r for r in worker_records(caplog) if r.levelno == logging.ERROR)
+    message = error.getMessage()
+    assert message.startswith("worker-0: iteration failed\nTraceback (most recent call last):\n")
+    assert re.search(r'File ".*app[\\/]worker\.py", line \d+, in run', message)
+    assert message.endswith("\nsqlite3.IntegrityError (message omitted)")
+    assert error.exc_info is None
+    for leak in LEAKS:
+        assert leak not in caplog.text
+
+
+def test_sanitized_traceback_cuts_a_cycle():
+    first, second = ValueError("SECRET-one"), KeyError("SECRET-two")
+    first.__context__, second.__context__ = second, first
+    text = format_sanitized_traceback(first)
+    assert re.findall(r"(\w+) \(message omitted\)", text) == ["KeyError", "ValueError"]
+    assert "SECRET" not in text
+
+
+def test_sanitized_traceback_honours_suppressed_context():
+    # Messages come from variables: a frame shows its source line, so a literal there would show.
+    inner, outer = "SECRET-inner", "SECRET-outer"
+    try:
+        try:
+            raise KeyError(inner)
+        except KeyError:
+            raise ValueError(outer) from None
+    except ValueError as exc:
+        text = format_sanitized_traceback(exc)
+    assert re.findall(r"(\w+) \(message omitted\)", text) == ["ValueError"]
+    assert text.startswith("Traceback (most recent call last):\n") and "SECRET" not in text
+
+
 LINE_RE = re.compile(
     r"worker-0: t-1001 attempt (\d)/3 -> (.+) prompt=(v1|-) truncated=(true|false|-) \d+\.\d{3}s"
 )
@@ -631,8 +756,10 @@ async def test_run_survives_a_repository_error(repository, settings, caplog):
         await stop(task)
     assert flaky.failures == 1
     [error] = [r for r in worker_records(caplog) if r.levelno == logging.ERROR]
-    assert "worker-0: iteration failed" in error.getMessage()
-    assert error.exc_info[0] is sqlite3.OperationalError
+    message = error.getMessage()
+    assert message.startswith("worker-0: iteration failed\nTraceback (most recent call last):\n")
+    assert message.endswith("\nsqlite3.OperationalError (message omitted)")
+    assert error.exc_info is None
 
 
 async def test_run_exits_on_cancel_and_logs_stop(repository, settings, caplog):

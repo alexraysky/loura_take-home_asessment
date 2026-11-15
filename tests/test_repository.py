@@ -7,7 +7,7 @@ import pytest
 
 from app.clock import format_ts
 from app.models import Ticket
-from app.repository import _COLUMNS
+from app.repository import _COLUMNS, Repository
 from app.validation import FLAG_REASON_ECHO, Accepted
 
 
@@ -365,6 +365,20 @@ def test_finish_retry_sets_backoff_and_releases_the_claim(repository, clock):
         updated_at=format_ts(clock()),
     )
     assert (stored.status, stored.attempts) == ("pending", 1)
+
+
+def test_finish_retry_reads_the_clock_once(db, clock):
+    def ticking():
+        clock.advance(1)  # every read is a second later
+        return clock()
+
+    repository = Repository(db, ticking)
+    repository.insert_ticket("t-1", "", "x")
+    ticket = claim(repository)
+    assert repository.finish_retry("t-1", token=ticket.claimed_at, code="llm_timeout", delay_s=2.5) is True
+    stored = repository.get_ticket("t-1")
+    assert stored.next_attempt_at == format_ts(clock() + timedelta(seconds=2.5))
+    assert stored.updated_at == format_ts(clock())
 
 
 def test_finish_retry_with_the_echo_flag_flags_the_row(repository):
