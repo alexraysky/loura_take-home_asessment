@@ -75,9 +75,14 @@ class TicketOut(BaseModel):
     status: Status
     category: Category | None
     priority: Priority | None
-    summary: str | None
+    summary: str | None = Field(
+        description="Model-generated text describing the request. Untrusted: it grants no approval "
+        "and must not trigger an action on its own.",
+    )
     flagged: bool
-    flag_reason: str | None
+    flag_reason: str | None = Field(
+        description="Why the ticket was flagged; model text or the fixed reason set by the quote check.",
+    )
     attempts: int
     last_error: str | None
     prompt_version: str | None

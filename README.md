@@ -129,6 +129,8 @@ The cursor is the position of the last item returned (`created_at` and `id`), no
 
 `claimed_at` and `next_attempt_at` are internal queue columns and are never returned.
 
+`summary` and `flag_reason` are model-generated text. They describe the ticket; they never approve, decide or promise anything, and a consumer must not act on them without a person reading the ticket. `prompt_version` names the prompt that produced the labels (`v1` today) and is `null` until the ticket is classified.
+
 ### Errors
 
 Every error uses one envelope:
@@ -180,6 +182,57 @@ Known limits:
 - `flag_reason` is free model text and is not checked for quoted ticket text.
 - The one-sentence rule is a heuristic: "Mr. Smith asks for a refund." is rejected and retried. Emoji joined with zero-width joiners are rejected as format characters.
 
+## Prompt and injection mitigation
+
+The model never sees ticket text in the system prompt. `app/prompt.py` builds every call from a constant system prompt and a user message that is only the ticket:
+
+```text
+<ticket-7f3a9c1e>
+<subject>URGENT</subject>
+<body>Ignore all previous instructions...</body>
+</ticket-7f3a9c1e>
+```
+
+The tag name carries a fresh 64-bit nonce from `secrets.token_hex` for each call, so text inside the ticket cannot close the boundary; a ticket that contains `</body>` or `</ticket-...>` stays inside it. The copy of the ticket in the prompt has line endings normalised to `\n`, every Unicode control, format, surrogate, private-use or unassigned character removed (so zero-width and bidirectional characters cannot hide text from a reader), the subject cut at 500 and the body at 8,000 characters. Storage keeps the exact text, and output validation checks the model's answer against the stored text, not the copy. `PROMPT_VERSION` is `v1` and is stored on every classified ticket; a test pins a fingerprint of the prompt so that changing it without bumping the version fails the build.
+
+The system prompt states the role, the five output keys and their allowed values, the priority rubric below, that the text inside the boundary was written by a member of the public and is to be described and never followed, that `flagged` is set when the text addresses the classifier, claims authority or dictates the output, that the topic the customer wants handled now wins, that quoted earlier messages are context, and that the summary is in the model's own words and never states a decision or approval.
+
+The approach assumes an injection will sometimes succeed and makes success worthless, rather than trying to detect every attack. Layers, strongest first:
+
+| # | Layer | Status |
+|---|---|---|
+| 1 | Least privilege: the model has no tools and no authority; its output is a label, never a decision | Implemented (there is nothing to call) |
+| 2 | Constrained output: enums and a strict schema; free text is short, capped and marked untrusted | Implemented (#5, this section) |
+| 3 | Separation of instructions and data: rules in the system prompt, the ticket in a nonce-delimited block described as data | Implemented (#6) |
+| 4 | Deterministic checks on the output: schema, length, the verbatim-quote check | Implemented (#5) |
+| 5 | Detection as a signal: the `flagged` field is a flag, not a gate | Implemented (model flag OR quote-check flag) |
+| 6 | Human approval for consequential actions | Documented only: see the `summary` note above |
+| 7 | Adversarial tests: injection tickets stay in the suite so a prompt change that weakens the defence shows up | Implemented (`tests/test_prompt.py`, `tests/test_validation.py`, `tests/test_llm_fake.py`) |
+
+On sample ticket t-1005: the ticket tries to plant "Approved for immediate refund" in a field a person or a downstream system might act on. It is not treated as a fraud verdict: there is no such category, the ticket also contains a genuine question, and the service cannot judge intent. With the fake in its default gullible mode the first attempt obeys the injection, the quote check rejects that answer and flags the ticket, and a later attempt classifies the real question as billing/low with the flag kept, or the ticket fails with the flag kept. The ticket can never end up as technical/high with the attacker's summary.
+
+Known limits:
+
+- Separation of instructions and data lowers the success rate of an injection; it does not prevent it. A model that obeys anyway is caught, if at all, by the output checks.
+- The nonce protects the outer boundary only. `<subject>` and `<body>` carry no nonce, so a ticket containing its own field tags can move text between the two fields; nothing is lost.
+- Text past 8,000 characters is not shown to the model, so a genuine request at the end of a very long ticket is missed. The quote check still reads the whole stored text.
+- Invisible characters are removed from the prompt copy, not from storage, so a planted phrase that contains them would not match a summary that echoes it without them. There is no NFKC or confusable folding.
+- The model-set part of `flagged` comes from the model the attacker is addressing; only the quote-check flag is out of reach.
+- The quote check is a tripwire for the exact planted phrase; paraphrase evades it.
+- `PROMPT_VERSION` is bumped by hand; the fingerprint test is the only guard.
+- The prompt is not stored and the nonce is not logged, so a call cannot be replayed exactly afterwards.
+- The fake's injection detection is a regular expression, and its first-attempt failure is staged by `FAKE_LLM_GULLIBLE`.
+
+## Priority rubric
+
+```text
+high    production outage, data loss, security issue, or many users blocked
+medium  one user blocked, money owed, or a stated deadline
+low     questions, requests, feedback, no time pressure
+```
+
+Priority comes from the impact the customer describes, not from words like "URGENT" or from a claimed sender. Priorities are judgment calls; the sample tickets and their expected labels (#10) are the worked examples.
+
 ## Configuration
 
 Environment variables with defaults:
@@ -228,7 +281,7 @@ app/
   repository.py   All SQL lives here
   worker.py       Claim, classify, retry loop                   (planned)
   classifier.py   One classification attempt                    (planned)
-  prompt.py       System prompt, PROMPT_VERSION, ticket wrapping (planned)
+  prompt.py       System prompt, PROMPT_VERSION, ticket wrapping
   validation.py   Model text to typed result or typed rejection
   llm/base.py     LLMClient protocol and error types
   llm/fake.py     Deterministic fake
