@@ -2128,3 +2128,62 @@ def test_unresolved_double_charge_still_owes_a_refund(body):
 def test_clauses_are_dropped_up_to_the_last_resolution(sentence, active, unresolved):
     assert fake_mod._active_sentence(sentence) == active
     assert fake_mod._unresolved_sentence(sentence) == (sentence if unresolved is None else unresolved)
+
+
+@pytest.mark.parametrize(
+    ("body", "expected"),
+    [
+        ("The outage is not resolved now.", ("technical", "high")),
+        ("The outage from yesterday is not resolved now.", ("technical", "high")),
+        ("Our API went down this morning, and it is not fixed.", ("technical", "high")),
+        ("I am locked out and my account is not restored now.", ("account", "medium")),
+    ],
+)
+def test_denied_recovery_keeps_the_problem_active(body, expected):
+    answer = classify_text("", body)
+    assert (answer["category"], answer["priority"]) == expected
+
+
+@pytest.mark.parametrize(
+    ("body", "expected"),
+    [
+        ("We found a security breach, but the export is fixed now.", ("technical", "high")),
+        ("I was charged twice; my password reset is fixed now.", ("billing", "medium")),
+        ("My account password is fixed now, but I was charged twice.", ("billing", "medium")),
+        ("I was charged twice, but the export is fixed now.", ("billing", "medium")),
+    ],
+)
+def test_unrelated_recovery_keeps_the_earlier_problem(body, expected):
+    answer = classify_text("", body)
+    assert (answer["category"], answer["priority"]) == expected
+
+
+def test_unrelated_recovery_still_owes_the_double_charge():
+    answer = classify_text("", "I was charged twice; my password reset is fixed now.")
+    assert answer["summary"] == "Customer was charged twice and requests a refund of one charge."
+
+
+@pytest.mark.parametrize(
+    ("body", "expected"),
+    [
+        ("I was charged twice, but that is resolved now.", ("billing", "low")),
+        ("I was charged twice yesterday, but it was refunded.", ("billing", "low")),
+        ("The export was broken, but it works now.", ("technical", "low")),
+    ],
+)
+def test_anaphoric_recovery_resolves_the_earlier_problem(body, expected):
+    answer = classify_text("", body)
+    assert (answer["category"], answer["priority"]) == expected
+
+
+@pytest.mark.parametrize(
+    ("sentence", "unresolved"),
+    [
+        ("our site was down yesterday, but is fine now.", ""),
+        ("following up: the export is fixed now.", ""),
+        ("i was charged twice; my password reset is fixed now.", "i was charged twice"),
+        ("the outage is not resolved now.", "the outage is not resolved now."),
+    ],
+)
+def test_resolution_drops_only_the_clauses_it_resolves(sentence, unresolved):
+    assert fake_mod._unresolved_sentence(sentence) == unresolved

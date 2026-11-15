@@ -445,12 +445,23 @@ _RESOLVED_RE = _cues(
 # A present-tense problem state is going on now, whatever past change caused it: "Our API is down
 # after last week's release.", "All users are locked out after last week's upgrade.", "Login was
 # fixed this morning, but I am locked out.", "The outage was resolved, but the dashboard is slow."
-# The past tense ("We had an outage", "Our API went down last month") stays historical.
+# The past tense ("We had an outage", "Our API went down last month") stays historical. A recovery
+# that is denied ("The outage is not resolved now.", "it isn't fixed yet") is a present problem too.
+_NOT_RECOVERED_STATE = (
+    r"(?:yet |fully |completely )?(?:been )?(?:fixed|resolved|restored|recovered|working|up|online"
+    r"|back(?: up| online| to normal)?|refunded|credited|reimbursed)"
+)
+_DENIED_RECOVERY = (
+    r"(?:am|is|are|'m|'s|'re|has been|have been|'ve been) (?:still |currently |completely |totally )?"
+    rf"(?:unresolved|unfixed|(?:not|never) {_NOT_RECOVERED_STATE})",
+    rf"(?:isn'?t|aren'?t|hasn'?t|haven'?t) {_NOT_RECOVERED_STATE}",
+)
 _ACTIVE_STATE_RE = _cues(
     r"(?:am|is|are|'m|'s|'re|has been|have been|'ve been) (?:still |currently |completely |totally )?"
     r"(?:down|broken|unavailable|failing|crashing|offline|locked out|blocked|degraded|compromised"
     r"|returning|throwing|losing|unable|not working|affected|impacted|slow|timing out|lagging|hanging"
     r"|freezing|stuck|unreachable|inaccessible)",
+    *_DENIED_RECOVERY,
     "returns?",
     "throws?",
     "fails?",
@@ -679,9 +690,45 @@ _NEGATED_RE = re.compile(
     r"|none(?: of (?:us|them|(?:our|the|my|these|those) \w+))?)"
     r"(?: (?:on|in|from) (?:our|the|my) \w+)?|n't)"
     r"(?: (?:am|is|are|was|were|be|been|being|have|had|has|having|see|seen|seeing|experience[sd]?|experiencing))?"
-    r"(?: (?:a|an|the|any|more|further|single|real|actual|confirmed|ongoing|active|reported|production|security))*"
+    r"(?: (?:a|an|the|any|more|further|single|real|actual|confirmed|ongoing|active|reported|production|security|yet"
+    r"|still|fully|completely))*"
     r"(?: \w+(?: \w+)? (?:or|nor))?"
     r" \Z"
+)
+# A resolution with an omitted, anaphoric or generic subject closes the problem told before it: "I
+# was charged twice, but that is resolved now.", "The export was broken, but it works now.", "Our
+# site was down yesterday, but is fine now." One that names its own subject ("but the export is
+# fixed now") closes only that, so an earlier unrelated problem stays. A denied recovery with such a
+# subject keeps the earlier problem going: "Our API went down this morning, and it is not fixed."
+# Both are matched from the clause start.
+_ANAPHORIC_SUBJECT = (
+    r"\s*(?:(?:and|so|then|also|now|thankfully|luckily|fortunately|happily|gladly"
+    r"|never ?mind|disregard(?: that| this)?) )*"
+    r"(?:it|that|this|they|everything|all|both|the (?:issue|problem|matter|situation))?"
+)
+_ANAPHORIC_RESOLVED_RE = re.compile(
+    _ANAPHORIC_SUBJECT + r"(?:'s|'re|\s*\b(?:is|are|was|were|has been|have been|got|seems?|works?|worked"
+    r"|came|come|comes|went|resolved|fixed|sorted|cleared)\b)?\s*"
+    rf"(?:{_RESOLVED_RE.pattern})",
+)
+_ANAPHORIC_DENIED_RE = re.compile(_ANAPHORIC_SUBJECT + r"\s*" + _cues(*_DENIED_RECOVERY).pattern)
+# Concrete problem wording in a clause. A clause without any ("Following up: the export is fixed
+# now.") only leads up to a later resolution, so it goes with it.
+_CONCRETE_PROBLEM_RE = re.compile(
+    "|".join(
+        p.pattern
+        for p in (
+            _INCIDENT_RE,
+            _VULN_RE,
+            _BLOCKED_RE,
+            _FAILURE_RE,
+            _PROBLEM_RE,
+            _DEGRADED_RE,
+            _DOUBLE_CHARGE_RE,
+            _MONEY_OWED_RE,
+            _DEADLINE_RE,
+        )
+    )
 )
 # A whole sentence of closing courtesy ("Thanks again!", "Can't wait to hear back.") is not a
 # request, so its "again" or "can't" must not read as a follow-up or a blocker.
@@ -874,8 +921,20 @@ def classify_text(subject: str, body: str) -> dict[str, Any]:
     nb = " ".join(body_sentences)
     whole = f"{ns} {nb}"
 
+    unresolved_subject = [u for s in subject_sentences if (u := _unresolved_sentence(s))]
+    unresolved_body = [u for s in body_sentences if (u := _unresolved_sentence(s))]
+    unresolved_sentences = unresolved_subject + unresolved_body
+    # A resolved clause does not vote for its category while the rest still names one: "My account
+    # password is fixed now, but I was charged twice." is about billing.
+    if unresolved_sentences != sentences and any(
+        cues.search(u) for u in unresolved_sentences for cues in _CATEGORY_CUES.values()
+    ):
+        ns_scored, nb_scored = " ".join(unresolved_subject), " ".join(unresolved_body)
+    else:
+        ns_scored, nb_scored = ns, nb
     scores = {
-        name: 3 * len(cues.findall(ns)) + len(cues.findall(nb)) for name, cues in _CATEGORY_CUES.items()
+        name: 3 * len(cues.findall(ns_scored)) + len(cues.findall(nb_scored))
+        for name, cues in _CATEGORY_CUES.items()
     }
     # Equal scores go to the category of the sentences that report a blocker, so "I cannot change
     # my email address. How do I export data?" is about the account. max() keeps the first of
@@ -887,7 +946,6 @@ def classify_text(subject: str, body: str) -> dict[str, Any]:
     # may still be owed, and drop only what a resolution closes: "I was charged twice, but it was
     # refunded."
     active_sentences = [a for s in sentences if (a := _active_sentence(s))]
-    unresolved_sentences = [u for s in sentences if (u := _unresolved_sentence(s))]
     reported = " ".join(_reported_part(s) for s in active_sentences if _reports_blocker(s))
     best = max(scores, key=lambda name: (scores[name], len(_CATEGORY_CUES[name].findall(reported))))
     blocked = any(map(_reports_blocker, active_sentences))
@@ -1027,15 +1085,31 @@ def _is_question(sentence: str) -> bool:
     return sentence.endswith("?") or bool(_HOWTO_RE.search(sentence) or _QUESTION_RE.search(sentence))
 
 
-def _drop_clauses(sentence: str, *, drop_past: bool) -> str:
-    """The sentence without its clauses up to the last one that says a problem is resolved.
+def _has_resolution(text: str) -> bool:
+    # "The outage is not resolved now." denies the recovery it names.
+    return any(
+        not _NEGATED_RE.search(text, max(0, m.start() - _NEGATION_WINDOW), m.start())
+        for m in _RESOLVED_RE.finditer(text)
+    )
 
-    With ``drop_past`` the clauses after it that only tell of a past problem go too. A clause that
-    says the problem goes on, states a present problem or imagines one is always kept.
+
+def _clause_has_problem(clause: str) -> bool:
+    return _CONCRETE_PROBLEM_RE.search(clause) is not None
+
+
+def _drop_clauses(sentence: str, *, drop_past: bool) -> str:
+    """The sentence without its resolution clauses and the problems they resolve.
+
+    A resolution resolves every earlier clause that names no problem of its own, and with an
+    anaphoric subject (see _ANAPHORIC_RESOLVED_RE) also the problems before it up to the next
+    clause that names one. With ``drop_past`` the clauses that only tell of a past problem go
+    too, unless a later anaphoric clause denies its recovery. A clause that says the problem goes
+    on, states a present problem or imagines one is always kept.
     """
     # "The export was fixed yesterday, but we found a security breach." still reports the breach,
-    # and "I was charged twice yesterday, but it was refunded." leaves nothing owed.
-    if not _RESOLVED_RE.search(sentence) and not (drop_past and _PAST_RE.search(sentence)):
+    # "I was charged twice yesterday, but it was refunded." leaves nothing owed and "I was charged
+    # twice; my password reset is fixed now." still owes a refund.
+    if not _has_resolution(sentence) and not (drop_past and _PAST_RE.search(sentence)):
         return sentence
     question = _is_question(sentence)
     cues = _HYPOTHETICAL_RE if question else _PREVENTIVE_RE
@@ -1049,15 +1123,29 @@ def _drop_clauses(sentence: str, *, drop_past: bool) -> str:
         bool(cues.search(clause) or _ONGOING_RE.search(clause) or _ACTIVE_STATE_RE.search(clause))
         for _, clause in clauses
     ]
-    last_resolved = max(
-        (i for i, (_, clause) in enumerate(clauses) if not held[i] and _RESOLVED_RE.search(clause)),
-        default=-1,
-    )
-    kept = [
-        (sep, clause)
-        for i, (sep, clause) in enumerate(clauses)
-        if held[i] or (i > last_resolved and not (drop_past and _PAST_RE.search(clause)))
-    ]
+    # One pass from the end: later says a resolution follows, reach that an anaphoric one follows
+    # with no clause naming a problem in between, and persists the same for a denied recovery.
+    dropped = [False] * len(clauses)
+    later = reach = persists = False
+    for i in range(len(clauses) - 1, -1, -1):
+        clause = clauses[i][1]
+        problem = _clause_has_problem(clause)
+        resolved = not held[i] and _has_resolution(clause)
+        dropped[i] = not held[i] and (
+            resolved
+            or (later and (reach or not problem))
+            or (drop_past and not persists and _PAST_RE.search(clause) is not None)
+        )
+        if resolved:
+            later = True
+            reach = reach or _ANAPHORIC_RESOLVED_RE.match(clause) is not None
+        elif problem:
+            reach = False
+        if held[i] and _ANAPHORIC_DENIED_RE.match(clause):
+            persists = True
+        elif problem:
+            persists = False
+    kept = [(sep, clause) for i, (sep, clause) in enumerate(clauses) if not dropped[i]]
     if len(kept) == len(clauses):
         return sentence
     # ", but " splits into an empty clause between the comma and the word, so empty clauses are
@@ -1308,7 +1396,7 @@ def _reports_follow_up(sentence: str) -> bool:
     # "I have asked twice and still have no response." is a follow-up, "How do I follow up on a
     # refund?" is a how-to question. A follow-up that confirms a recovery ("Following up: the
     # export is fixed now.") leaves nothing open, unlike "Our API went down yesterday; any update?".
-    if _is_past_or_resolved(sentence) and _RESOLVED_RE.search(_reported_part(sentence)):
+    if _is_past_or_resolved(sentence) and _has_resolution(_reported_part(sentence)):
         return False
     return _states(_FOLLOW_UP_RE, sentence, reported=True)
 
