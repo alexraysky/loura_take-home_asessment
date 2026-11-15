@@ -79,7 +79,7 @@ The expected labels, which are also the worked examples for the priority rubric:
 | t-1009 | technical | medium | no | Second topic (billing) is explicitly deferred; must not win |
 | t-1010 | technical | medium | no | Quoted staff text is not the customer's claim; repeat contact |
 
-With the default fake settings (`FAKE_LLM_SEED=42`, `FAKE_LLM_FAILURE_RATE=0.2`, `FAKE_LLM_GULLIBLE=true`) all ten end `classified` with these labels. Three need a second attempt, 1 to 2 s later: t-1001 and t-1003 draw a simulated failure first, and t-1005's first answer obeys the injection and is rejected by the quote check, so t-1005 ends flagged with reason `summary echoed quoted ticket text`. The draw is a hash of the seed, attempt number, and prompt, so another seed gives another mix, and a ticket can end `failed`: 0.2³ = 0.8 % per ticket, 0.2² = 4 % for t-1005, whose first attempt always goes to the injection. `FAKE_LLM_FAILURE_RATE=0 make run` gives a run without simulated failures; with `FAKE_LLM_GULLIBLE=false` as well, t-1005 is classified on its first attempt, flagged by the fake with reason `Ticket text addresses the classifier.`
+With the default fake settings (`FAKE_LLM_SEED=42`, `FAKE_LLM_FAILURE_RATE=0.2`, `FAKE_LLM_GULLIBLE=true`) all ten end `classified` with these labels. Three need a second attempt, 1 to 2 s later: t-1001 and t-1003 draw a simulated failure first, and t-1005's first answer obeys the injection and is rejected by the quote check, so t-1005 ends flagged with reason `summary echoed quoted ticket text`. The draw is a hash of the seed, the prompt, and how many times the fake has seen that prompt, so another seed gives another mix, and a ticket can end `failed`: 0.2³ = 0.8 % per ticket, 0.2² = 4 % for t-1005, whose first attempt always goes to the injection. `FAKE_LLM_FAILURE_RATE=0 make run` gives a run without simulated failures; with `FAKE_LLM_GULLIBLE=false` as well, t-1005 is classified on its first attempt, flagged by the fake with reason `Ticket text addresses the classifier.`
 
 ## API reference
 
@@ -88,8 +88,10 @@ With the default fake settings (`FAKE_LLM_SEED=42`, `FAKE_LLM_FAILURE_RATE=0.2`,
 ```sh
 curl -i -X POST http://127.0.0.1:8000/tickets \
   -H 'content-type: application/json' \
-  -d '{"id": "t-1001", "subject": "Charged twice this month", "body": "Hi, I see two charges..."}'
+  -d '{"id": "t-2001", "subject": "Charged twice this month", "body": "Hi, I see two charges..."}'
 ```
+
+On a database without `t-2001` this answers `202 Accepted` with the ticket in the pending shape shown under Ticket representation, even after Try it and `make seed`. Sending it again unchanged answers `200 OK`; sending it with the id `t-1001` instead, which Try it and `make seed` store with a longer body, answers `409 Conflict`, code `ticket_conflict`.
 
 | Field | Rules |
 |---|---|
@@ -145,10 +147,10 @@ Tickets are ordered by `created_at` ascending, then `id`, so new tickets land at
 ```json
 {
   "items": [
-    {"id": "t-1001", "status": "classified", "category": "billing", "priority": "high", "...": "..."},
-    {"id": "t-1003", "status": "classified", "category": "billing", "priority": "low", "...": "..."}
+    {"id": "t-1001", "status": "classified", "category": "billing", "priority": "medium", "flagged": false, "...": "..."},
+    {"id": "t-1005", "status": "classified", "category": "billing", "priority": "low", "flagged": true, "flag_reason": "summary echoed quoted ticket text", "...": "..."}
   ],
-  "next_cursor": "MjAyNi0xMS0xNFQxMjowMDowMC4wMDAwMDBafHQtMTAwMw"
+  "next_cursor": "MjAyNi0xMS0xNFQxMjowMDowMC4wMDAwMDBafHQtMTAwNQ"
 }
 ```
 
@@ -181,7 +183,7 @@ The path does not stop a ticket from having the id `reclassify`: `POST /tickets/
 
 ```json
 {
-  "id": "t-1001",
+  "id": "t-2001",
   "subject": "Charged twice this month",
   "body": "Hi, I see two charges...",
   "status": "pending",
@@ -364,10 +366,12 @@ The approach assumes an injection will sometimes succeed and makes success worth
 | 3 | Separation of instructions and data: rules in the system prompt, the ticket in a nonce-delimited block described as data | Implemented (this section) |
 | 4 | Deterministic checks on the output: schema, length, the verbatim-quote check | Implemented (see Model output validation) |
 | 5 | Detection as a signal: the `flagged` field is a flag, not a gate | Implemented (model flag OR quote-check flag) |
-| 6 | Human approval for consequential actions | Documented only: see the `summary` note above |
+| 6 | Human approval for consequential actions | Documented only: consumers must not act on `summary` (below and Ticket representation) |
 | 7 | Adversarial tests: injection tickets stay in the suite so a prompt change that weakens the defence shows up | Implemented (`tests/test_prompt.py`, `tests/test_validation.py`, `tests/test_llm_fake.py`) |
 
 On sample ticket t-1005: the ticket tries to plant "Approved for immediate refund" in a field a person or a downstream system might act on. It is not treated as a fraud verdict: there is no such category, the ticket also contains a genuine question, and the service cannot judge intent. With the fake in its default gullible mode the first attempt obeys the injection, the quote check rejects that answer and flags the ticket, and a later attempt classifies the real question as billing/low with the flag kept, or the ticket fails with the flag kept. The ticket can never end up as technical/high with the attacker's summary.
+
+What consumers must not do with `summary`: `summary` and `flag_reason` are model-generated text derived from untrusted input, so a consumer must never treat `summary` as authoritative or act on it, by approving a refund, making a decision or promising anything, without a person reading the original ticket. The same rule is stated under Ticket representation.
 
 Known limits:
 
