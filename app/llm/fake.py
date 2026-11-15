@@ -446,13 +446,16 @@ _RESOLVED_RE = _cues(
 # after last week's release.", "All users are locked out after last week's upgrade.", "Login was
 # fixed this morning, but I am locked out.", "The outage was resolved, but the dashboard is slow."
 # The past tense ("We had an outage", "Our API went down last month") stays historical. A recovery
-# that is denied ("The outage is not resolved now.", "it isn't fixed yet") is a present problem too.
+# that is denied ("The outage is not resolved now.", "it isn't fixed yet", "It has not been fixed.")
+# is a present problem too.
 _NOT_RECOVERED_STATE = (
-    r"(?:yet |fully |completely )?(?:been )?(?:fixed|resolved|restored|recovered|working|up|online"
+    r"(?:yet |still |fully |completely )?(?:been (?:yet |fully |completely )?)?"
+    r"(?:fixed|resolved|restored|recovered|working|up|online"
     r"|back(?: up| online| to normal)?|refunded|credited|reimbursed)"
 )
 _DENIED_RECOVERY = (
-    r"(?:am|is|are|'m|'s|'re|has been|have been|'ve been) (?:still |currently |completely |totally )?"
+    r"(?:am|is|are|'m|'s|'re|has(?: been)?|have(?: been)?|'ve(?: been)?)"
+    r" (?:still |currently |completely |totally )?"
     rf"(?:unresolved|unfixed|(?:not|never) {_NOT_RECOVERED_STATE})",
     rf"(?:isn'?t|aren'?t|hasn'?t|haven'?t) {_NOT_RECOVERED_STATE}",
 )
@@ -699,8 +702,9 @@ _NEGATED_RE = re.compile(
 # was charged twice, but that is resolved now.", "The export was broken. It works now.", "Our site
 # was down yesterday, but is fine now." One that names its own subject ("but the export is fixed
 # now") closes only a problem that names the same subject, so an earlier unrelated problem stays. A
-# denied recovery with such a subject keeps the earlier problem going: "Our API went down this
-# morning. It is not fixed." Both are matched from the clause start.
+# denied recovery or a "still" state with such a subject keeps the earlier problem going: "Our API
+# went down this morning. It is not fixed.", "Our API went down yesterday. It is still down." Both
+# are matched from the clause start.
 _ANAPHORIC_SUBJECT = (
     r"\s*(?:(?:and|so|then|also|now|thankfully|luckily|fortunately|happily|gladly|actually|update|edit"
     r"|resolved|fixed|never ?mind|disregard(?: that| this)?)[:,-]? )*"
@@ -711,7 +715,15 @@ _ANAPHORIC_RESOLVED_RE = re.compile(
     r"|came|come|comes|went|resolved|fixed|sorted|cleared)\b)?\s*"
     rf"(?:{_RESOLVED_RE.pattern})",
 )
-_ANAPHORIC_DENIED_RE = re.compile(_ANAPHORIC_SUBJECT + r"\s*" + _cues(*_DENIED_RECOVERY).pattern)
+_ANAPHORIC_DENIED_RE = re.compile(
+    _ANAPHORIC_SUBJECT
+    + r"\s*"
+    + _cues(
+        *_DENIED_RECOVERY,
+        r"(?:is|are|'s|'re|has been|have been|'ve been) still (?:down|broken|unavailable|failing|crashing"
+        r"|offline|locked out|blocked|degraded|slow|timing out|unreachable|inaccessible)",
+    ).pattern
+)
 # Words around the named subject of a resolution: "Update: the export is fixed now." names "export".
 _TARGET_LEADING = frozenset(
     "and so then also now actually update edit the a an my our your their this that these those".split()
@@ -720,6 +732,13 @@ _TARGET_TRAILING = frozenset("is are was were has have had been got seem seems '
 # A concessive recovery grants a past fix without retracting the problem before it: "The API is
 # still down, although it was fixed this morning." Matched from the clause start.
 _CONCESSIVE_RE = re.compile(r"\s*(?:although|even though|though|while|whereas)(?!\w)")
+# Resolution pruning also splits before a concessive word, so "The API is still down although it
+# was fixed this morning." keeps the problem apart from the recovery it grants. A negated "yet"
+# stays in its denial: "It has not yet been fixed."
+_DROP_SPLIT_RE = re.compile(
+    rf"(?:{_CLAUSE_SPLIT_RE.pattern})(?<!\bnot yet )(?<!\bnever yet )(?<!n't yet )"
+    r"| (?=(?:although|even though|though|while|whereas)\b)"
+)
 # Concrete problem wording in a clause. A clause without any ("Following up: the export is fixed
 # now.") only leads up to a later resolution, so it goes with it.
 _CONCRETE_PROBLEM_RE = re.compile(
@@ -976,9 +995,9 @@ def classify_text(subject: str, body: str) -> dict[str, Any]:
     # those sentences counts: "How can I avoid an outage, I am locked out." is about the account.
     # Technical, account and incident checks see only the active clauses, so a past or resolved
     # problem neither raises the ticket nor lends its scope to the summary: "All users were locked
-    # out yesterday, but the API is down." Billing and follow-up checks keep a past problem, which
-    # may still be owed, and drop only what a resolution closes: "I was charged twice, but it was
-    # refunded."
+    # out yesterday, but the API is down." Billing, deadline and follow-up checks keep a past
+    # problem, which may still be owed, and drop only what a resolution closes: "I was charged
+    # twice, but it was refunded.", "I needed the invoice by Friday. The invoice is fixed now."
     active_sentences = [a for a in _drop_sentences(sentences, drop_past=True) if a]
     reported = " ".join(_reported_part(s) for s in active_sentences if _reports_blocker(s))
     best = max(scores, key=lambda name: (scores[name], len(_CATEGORY_CUES[name].findall(reported))))
@@ -991,7 +1010,7 @@ def classify_text(subject: str, body: str) -> dict[str, Any]:
     # "How can I avoid being charged twice?" and "Is there a deadline to upgrade?" state neither.
     double_charged = any(_states(_DOUBLE_CHARGE_RE, s, reported=True) for s in unresolved_sentences)
     money_owed = any(map(_reports_money_owed, unresolved_sentences))
-    deadline = any(map(_reports_deadline, sentences))
+    deadline = any(map(_reports_deadline, unresolved_sentences))
     degraded = any(map(_reports_degradation, active_sentences))
     access_blocked = any(
         _states(_BLOCKED_RE, s, reported=True, require=_ACCOUNT_ACCESS_RE) for s in active_sentences
@@ -1164,6 +1183,33 @@ def _resolution_target(clause: str) -> str | None:
     return " ".join(words[begin:end]) or None
 
 
+def _and_clauses(sep_before: str, clause: str) -> list[tuple[str, str]]:
+    """The clause split before each " and " that starts a recovery or an unrelated problem."""
+    # "We found a security breach and the export is fixed now." splits, so the recovery does not
+    # take the breach with it; a shared subject keeps "The export was broken and is fixed now."
+    # whole up to its recovery and "Our API went down and is still down." whole.
+    pieces: list[tuple[str, str]] = []
+    sep, start, end = sep_before, 0, clause.find(" and ")
+    # Whether the current piece holds a recovery: joining a part never adds one, so its first part
+    # decides and each part is scanned once.
+    resolved = _has_resolution(clause[: len(clause) if end < 0 else end])
+    while end >= 0:
+        following = clause.find(" and ", end + 5)
+        part = clause[end + 5 : len(clause) if following < 0 else following]
+        if _has_resolution(part):
+            split, resolved = True, True
+        elif _clause_has_problem(part) and (resolved or _ASSERTED_CLAUSE_RE.match(part) is not None):
+            split, resolved = True, False
+        else:
+            split = False
+        if split:
+            pieces.append((sep, clause[start:end]))
+            sep, start = " and ", end + 5
+        end = following
+    pieces.append((sep, clause[start:]))
+    return pieces
+
+
 def _drop_sentences(sentences: list[str], *, drop_past: bool) -> list[str]:
     """The sentences without their resolution clauses and the problems they resolve, in order.
 
@@ -1175,8 +1221,9 @@ def _drop_sentences(sentences: list[str], *, drop_past: bool) -> list[str]:
     that only tell of a past problem go too, unless a later anaphoric clause denies its recovery. A
     clause that imagines a problem is always kept, and one that says it goes on or states a present
     problem is kept unless a present recovery closes it: "API is down. It is fixed now." A concessive
-    recovery ("although it was fixed this morning") closes nothing. A sentence with nothing left is
-    "".
+    recovery ("although it was fixed this morning") closes nothing. Clauses also split at " and "
+    where a recovery or an unrelated problem starts (see _and_clauses). A sentence with nothing left
+    is "".
     """
     # "The export was fixed yesterday, but we found a security breach." still reports the breach,
     # "I was charged twice. It was refunded." leaves nothing owed and "I was charged twice. My
@@ -1195,12 +1242,13 @@ def _drop_sentences(sentences: list[str], *, drop_past: bool) -> list[str]:
         cues = _HYPOTHETICAL_RE if _is_question(sentence) else _PREVENTIVE_RE
         first = len(clauses)
         sep_before, start = "", 0
-        for separator in (*_CLAUSE_SPLIT_RE.finditer(sentence), None):
-            clause = sentence[start : separator.start() if separator else len(sentence)]
-            clauses.append((sep_before, clause))
-            owner.append(index)
-            hypothetical.append(bool(cues.search(clause)))
-            held.append(hypothetical[-1] or bool(_ONGOING_RE.search(clause) or _ACTIVE_STATE_RE.search(clause)))
+        for separator in (*_DROP_SPLIT_RE.finditer(sentence), None):
+            end = separator.start() if separator else len(sentence)
+            for sep, clause in _and_clauses(sep_before, sentence[start:end]):
+                clauses.append((sep, clause))
+                owner.append(index)
+                hypothetical.append(bool(cues.search(clause)))
+                held.append(hypothetical[-1] or bool(_ONGOING_RE.search(clause) or _ACTIVE_STATE_RE.search(clause)))
             if separator is None:
                 break
             sep_before, start = separator.group(), separator.end()
@@ -1247,7 +1295,11 @@ def _drop_sentences(sentences: list[str], *, drop_past: bool) -> list[str]:
                     target = closed
                     present_reach = _PAST_RE.search(clause) is None
         else:
-            if problem:
+            # A problem ends the reach unless the recovery closes it and it is joined by " and " to
+            # another the recovery may close too: "The export was broken and the import failed and
+            # both are fixed now." An unclosed one always ends it: "We found a security breach and
+            # the export is fixed now." keeps the breach.
+            if problem and (not closes or clauses[i][0] != " and "):
                 target, present_reach = None, False
             if crossed and not dropped[i]:
                 later, target, present_reach = False, None, False
@@ -1526,14 +1578,14 @@ def _reports_repeat(sentence: str) -> bool:
 def _reports_impact(sentence: str) -> bool:
     """Whether the sentence describes impact that sets priority, whatever its tone."""
     # The same clauses as classify_text: the high-impact, blocker and degradation checks see no past
-    # and resolved clauses, and money owed and follow-ups drop only resolved ones.
+    # and resolved clauses, and money owed, deadlines and follow-ups drop only resolved ones.
     active = _active_sentence(sentence)
     unresolved = _unresolved_sentence(sentence)
     return bool(
         _reports_high_impact(active)
         or _reports_blocker(active)
         or (unresolved and _reports_money_owed(unresolved))
-        or _reports_deadline(sentence)
+        or (unresolved and _reports_deadline(unresolved))
         or _reports_degradation(active)
         or (unresolved and _reports_follow_up(unresolved))
     )

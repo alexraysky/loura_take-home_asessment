@@ -2279,3 +2279,51 @@ def test_present_recovery_closes_an_earlier_active_state_problem(subject, body, 
 def test_past_or_concessive_recovery_keeps_an_active_state_problem(body):
     answer = classify_text("", body)
     assert (answer["category"], answer["priority"]) == ("technical", "high")
+
+
+@pytest.mark.parametrize(
+    ("body", "expected"),
+    [
+        ("We found a security breach and the export is fixed now.", ("technical", "high")),
+        ("I was charged twice and my password reset is fixed now.", ("billing", "medium")),
+        ("My password reset is fixed now and I was charged twice.", ("billing", "medium")),
+    ],
+)
+def test_recovery_keeps_an_unrelated_problem_joined_by_and(body, expected):
+    answer = classify_text("", body)
+    assert (answer["category"], answer["priority"]) == expected
+
+
+def test_unrelated_recovery_joined_by_and_keeps_the_double_charge_summary():
+    answer = classify_text("", "I was charged twice and my password reset is fixed now.")
+    assert answer["summary"] == "Customer was charged twice and requests a refund of one charge."
+
+
+def test_shared_subject_recovery_joined_by_and_closes_its_problem():
+    answer = classify_text("", "The export was broken and is fixed now.")
+    assert (answer["category"], answer["priority"]) == ("technical", "low")
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        "Our API went down yesterday. It has not been fixed.",
+        "Our API went down yesterday. It has never been fixed.",
+        "Our API went down yesterday. It has not yet been fixed.",
+    ],
+)
+def test_uncontracted_present_perfect_denial_keeps_an_earlier_outage(body):
+    answer = classify_text("", body)
+    assert (answer["category"], answer["priority"]) == ("technical", "high")
+
+
+def test_resolved_request_does_not_keep_its_deadline():
+    answer = classify_text("", "I needed the invoice by Friday. The invoice is fixed now.")
+    assert (answer["category"], answer["priority"]) == ("billing", "low")
+    assert answer["summary"] == "Customer asks a question about billing."
+
+
+def test_unrelated_recovery_keeps_an_open_deadline():
+    answer = classify_text("", "Please add a seat to my account by Friday. The export is fixed now.")
+    assert (answer["category"], answer["priority"]) == ("account", "medium")
+    assert answer["summary"] == "Customer needs an account matter resolved before a stated deadline."
