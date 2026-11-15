@@ -414,7 +414,7 @@ _PAST_RE = _cues(
 # over, so its "now", "again" or "today" is not ongoing wording. Each lookbehind is fixed-width.
 _RECOVERED = (
     "fine|fixed|resolved|restored|recovered|work|works|working|running|operational|normal|good"
-    "|online|ok|okay|sorted|cleared"
+    "|online|ok|okay|sorted|cleared|refunded|credited|reimbursed"
 )
 # "up" is a recovery only after a state verb ("is up", "back up"), so the phrasal verbs in
 # "Following up again", "sign up today" and "set up now" are not.
@@ -434,8 +434,8 @@ _ONGOING_RE = _cues(
 )
 _RESOLVED_RE = _cues(
     rf"(?:{_RECOVERED}|(?:is|are|'s|'re|was|were|back) up) (?:again )?(?:now|again|today)",
-    r"(?:is|are|'s|'re|was|were|has been|have been|got) (?:all )?(?:fixed|resolved|restored|recovered|sorted"
-    r"|cleared(?: up)?)",
+    r"(?:is|are|'s|'re|was|were|has been|have been|got) (?:all )?(?:fixed|resolved|restored|recovered"
+    r"|refunded|credited|reimbursed|sorted|cleared(?: up)?)",
     r"(?:resolved|fixed|sorted) itself",
     r"(?:is|are|'s|'re|came|come|comes|went) back (?:up|online|to normal)",
     r"back to normal",
@@ -881,20 +881,27 @@ def classify_text(subject: str, body: str) -> dict[str, Any]:
     # my email address. How do I export data?" is about the account. max() keeps the first of
     # equal keys, so remaining ties go technical > billing > account. Only the reported part of
     # those sentences counts: "How can I avoid an outage, I am locked out." is about the account.
-    reported = " ".join(_reported_part(s) for s in sentences if _reports_blocker(s))
+    # Technical, account and incident checks see only the active clauses, so a past or resolved
+    # problem neither raises the ticket nor lends its scope to the summary: "All users were locked
+    # out yesterday, but the API is down." Billing and follow-up checks keep a past problem, which
+    # may still be owed, and drop only what a resolution closes: "I was charged twice, but it was
+    # refunded."
+    active_sentences = [a for s in sentences if (a := _active_sentence(s))]
+    unresolved_sentences = [u for s in sentences if (u := _unresolved_sentence(s))]
+    reported = " ".join(_reported_part(s) for s in active_sentences if _reports_blocker(s))
     best = max(scores, key=lambda name: (scores[name], len(_CATEGORY_CUES[name].findall(reported))))
-    blocked = any(map(_reports_blocker, sentences))
-    high_sentences = [s for s in sentences if _reports_high_impact(s)]
+    blocked = any(map(_reports_blocker, active_sentences))
+    high_sentences = [s for s in active_sentences if _reports_high_impact(s)]
     high = bool(high_sentences)
     # The summary names production or scale only when a high-impact sentence reports it.
     production = any(map(_reports_production_impact, high_sentences))
     wide = any(map(_reports_wide_impact, high_sentences))
     # "How can I avoid being charged twice?" and "Is there a deadline to upgrade?" state neither.
-    double_charged = any(_states(_DOUBLE_CHARGE_RE, s, reported=True) for s in sentences)
-    money_owed = any(map(_reports_money_owed, sentences))
+    double_charged = any(_states(_DOUBLE_CHARGE_RE, s, reported=True) for s in unresolved_sentences)
+    money_owed = any(map(_reports_money_owed, unresolved_sentences))
     deadline = any(map(_reports_deadline, sentences))
-    degraded = any(map(_reports_degradation, sentences))
-    followed_up = any(map(_reports_follow_up, sentences))
+    degraded = any(map(_reports_degradation, active_sentences))
+    followed_up = any(map(_reports_follow_up, unresolved_sentences))
     # Suggestion wording next to a reported problem ("Our export is timing out. Would love help
     # with this.") does not turn the problem into a feature request.
     feature = bool(_FEATURE_RE.search(whole))
@@ -907,7 +914,7 @@ def classify_text(subject: str, body: str) -> dict[str, Any]:
     # Bare repeat wording ("still", "again") raises a ticket unless it only modifies a how-to
     # question ("How can I see my invoice again?"); a reported follow-up raises it even then.
     # "What if my export fails again?" only imagines a repeat.
-    repeated = followed_up or any(map(_reports_repeat, sentences))
+    repeated = followed_up or any(map(_reports_repeat, unresolved_sentences))
     impaired = blocked or degraded
     if high:
         priority = "high"
@@ -1020,19 +1027,51 @@ def _is_question(sentence: str) -> bool:
     return sentence.endswith("?") or bool(_HOWTO_RE.search(sentence) or _QUESTION_RE.search(sentence))
 
 
-def _is_past_or_resolved(sentence: str) -> bool:
-    """Whether the reported part of the sentence tells of a problem that is over."""
-    # "We had a production outage last year; how do I get the SLA report?", "Our site was down
-    # yesterday but is fine now." and "Fixed now - our dashboard is back up." mention a past or
-    # resolved problem; wording that says it is still going on, or a present-tense problem state
-    # ("Our API is down after last week's release."), keeps it a report. That wording counts only
-    # when stated, so "We had an outage yesterday; what if it happens again?" stays past.
-    reported = _reported_part(sentence)
-    return (
-        bool(_PAST_RE.search(reported) or _RESOLVED_RE.search(reported))
-        and not _states(_ONGOING_RE, sentence, reported=True)
-        and not _states(_ACTIVE_STATE_RE, sentence, reported=True)
+def _drop_clauses(sentence: str, *, drop_past: bool) -> str:
+    """The sentence without its clauses up to the last one that says a problem is resolved.
+
+    With ``drop_past`` the clauses after it that only tell of a past problem go too. A clause that
+    says the problem goes on, states a present problem or imagines one is always kept.
+    """
+    # "The export was fixed yesterday, but we found a security breach." still reports the breach,
+    # and "I was charged twice yesterday, but it was refunded." leaves nothing owed.
+    if not _RESOLVED_RE.search(sentence) and not (drop_past and _PAST_RE.search(sentence)):
+        return sentence
+    question = _is_question(sentence)
+    cues = _HYPOTHETICAL_RE if question else _PREVENTIVE_RE
+    clauses: list[tuple[str, str]] = []
+    sep_before, start = "", 0
+    for separator in _CLAUSE_SPLIT_RE.finditer(sentence):
+        clauses.append((sep_before, sentence[start : separator.start()]))
+        sep_before, start = separator.group(), separator.end()
+    clauses.append((sep_before, sentence[start:]))
+    held = [
+        bool(cues.search(clause) or _ONGOING_RE.search(clause) or _ACTIVE_STATE_RE.search(clause))
+        for _, clause in clauses
+    ]
+    last_resolved = max(
+        (i for i, (_, clause) in enumerate(clauses) if not held[i] and _RESOLVED_RE.search(clause)),
+        default=-1,
     )
+    kept = [
+        (sep, clause)
+        for i, (sep, clause) in enumerate(clauses)
+        if held[i] or (i > last_resolved and not (drop_past and _PAST_RE.search(clause)))
+    ]
+    if len(kept) == len(clauses):
+        return sentence
+    # ", but " splits into an empty clause between the comma and the word, so empty clauses are
+    # skipped and the first kept clause loses its separator.
+    kept = [(sep, clause.strip()) for sep, clause in kept if clause.strip()]
+    if not kept:
+        return ""
+    active = kept[0][1]
+    for sep, clause in kept[1:]:
+        # Every separator is "," ";" ":" or a word between spaces, so one space follows it.
+        active += f"{sep.rstrip()} {clause}"
+    if question and not active.endswith("?"):
+        active += "?"
+    return active
 
 
 def _active_sentence(sentence: str) -> str:
@@ -1040,29 +1079,22 @@ def _active_sentence(sentence: str) -> str:
     # "The outage was resolved this morning, but the dashboard is slow." still reports the slow
     # dashboard, not the outage. A clause that says the problem goes on ("Our API went down
     # yesterday and is still down.") or imagines it ("what if it happens again?") is kept.
-    if _is_past_or_resolved(sentence):
-        return ""
-    if not (_PAST_RE.search(sentence) or _RESOLVED_RE.search(sentence)):
-        return sentence
-    ongoing = _states(_ONGOING_RE, sentence, reported=True)
-    cues = _HYPOTHETICAL_RE if _is_question(sentence) else _PREVENTIVE_RE
-    clauses = [clause.strip() for clause in _CLAUSE_SPLIT_RE.split(sentence)]
-    kept = [
-        clause
-        for clause in clauses
-        if cues.search(clause)
-        or _ONGOING_RE.search(clause)
-        or _ACTIVE_STATE_RE.search(clause)
-        or not (_RESOLVED_RE.search(clause) or (not ongoing and _PAST_RE.search(clause)))
-    ]
-    if not kept:
-        return ""
-    if len(kept) == len(clauses):
-        return sentence
-    active = ", ".join(clause for clause in kept if clause)
-    if _is_question(sentence) and not active.endswith("?"):
-        active += "?"
-    return active
+    return _drop_clauses(sentence, drop_past=True)
+
+
+def _unresolved_sentence(sentence: str) -> str:
+    """The sentence without its clauses up to a resolution; a past problem stays, as it may be owed."""
+    # "I was charged twice last week, please refund one." still owes a refund.
+    return _drop_clauses(sentence, drop_past=False)
+
+
+def _is_past_or_resolved(sentence: str) -> bool:
+    """Whether the reported part of the sentence tells only of a problem that is over."""
+    # "We had a production outage last year; how do I get the SLA report?", "Our site was down
+    # yesterday but is fine now." and "Fixed now - our dashboard is back up." mention a past or
+    # resolved problem; wording that says it is still going on, or a present-tense problem state
+    # ("Our API is down after last week's release."), keeps it a report.
+    return not _active_sentence(_reported_part(sentence))
 
 
 def _reports_high_impact(sentence: str) -> bool:
@@ -1285,24 +1317,24 @@ def _reports_repeat(sentence: str) -> bool:
     # "Our API went down two days ago." and "The export is fixed now and working again." tell of
     # a problem that is over, so their repeat cues are only dates or a recovery. A dated earlier
     # contact still waits for an answer: "I asked about my invoice two days ago."
+    # Callers pass unresolved sentences, so a recovery's clauses are already gone.
     if _is_past_or_resolved(sentence):
-        return (
-            not _RESOLVED_RE.search(_reported_part(sentence))
-            and _states(_CONTACT_RE, sentence, reported=True)
-            and _states(_REPEAT_RE, sentence, reported=True)
-        )
+        return _states(_CONTACT_RE, sentence, reported=True) and _states(_REPEAT_RE, sentence, reported=True)
     return _states(_REPEAT_RE, sentence, reported=True)
 
 
 def _reports_impact(sentence: str) -> bool:
     """Whether the sentence describes impact that sets priority, whatever its tone."""
+    # The same clauses as classify_text: the high-impact, blocker and degradation checks drop past
+    # and resolved clauses themselves, and money owed and follow-ups drop only resolved ones.
+    unresolved = _unresolved_sentence(sentence)
     return bool(
         _reports_high_impact(sentence)
         or _reports_blocker(sentence)
-        or _reports_money_owed(sentence)
+        or (unresolved and _reports_money_owed(unresolved))
         or _reports_deadline(sentence)
         or _reports_degradation(sentence)
-        or _reports_follow_up(sentence)
+        or (unresolved and _reports_follow_up(unresolved))
     )
 
 

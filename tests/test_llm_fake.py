@@ -2061,3 +2061,70 @@ def test_up_after_a_state_verb_is_a_recovery(body):
 )
 def test_problems_still_going_on_after_a_past_clause_stay_high(body):
     assert classify_text("", body)["priority"] == "high"
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        "The export was fixed yesterday, but we found a security breach.",
+        "Login was fixed this morning, but we had a data leak.",
+    ],
+)
+def test_incident_after_a_resolved_clause_stays_high(body):
+    assert classify_text("", body)["priority"] == "high"
+
+
+def test_breach_after_a_resolved_export_is_a_technical_incident():
+    answer = classify_text("", "The export was fixed yesterday, but we found a security breach.")
+    assert (answer["category"], answer["priority"]) == ("technical", "high")
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        "All users were locked out yesterday, but the API is down.",
+        "The production outage was resolved this morning, but the staging API is down.",
+    ],
+)
+def test_past_scope_does_not_reach_the_summary_of_a_current_incident(body):
+    answer = classify_text("", body)
+    assert (answer["category"], answer["priority"]) == ("technical", "high")
+    assert answer["summary"] == "Customer reports a severe technical problem."
+
+
+@pytest.mark.parametrize(
+    "body",
+    ["I was charged twice but that is resolved now.", "I was charged twice yesterday, but it was refunded."],
+)
+def test_resolved_double_charge_owes_nothing(body):
+    answer = classify_text("", body)
+    assert (answer["category"], answer["priority"]) == ("billing", "low")
+    assert answer["summary"] == "Customer asks a question about billing."
+
+
+@pytest.mark.parametrize(
+    "body",
+    ["Login was fixed this morning, but I was charged twice.", "I was charged twice last week, please refund one."],
+)
+def test_unresolved_double_charge_still_owes_a_refund(body):
+    answer = classify_text("", body)
+    assert (answer["category"], answer["priority"]) == ("billing", "medium")
+    assert answer["summary"] == "Customer was charged twice and requests a refund of one charge."
+
+
+@pytest.mark.parametrize(
+    ("sentence", "active", "unresolved"),
+    [
+        (
+            "The export was fixed yesterday, but we found a security breach.",
+            "we found a security breach.",
+            "we found a security breach.",
+        ),
+        ("All users were locked out yesterday, but the API is down.", "the API is down.", None),
+        ("I was charged twice yesterday, but it was refunded.", "", ""),
+        ("I was charged twice last week, please refund one.", "please refund one.", None),
+    ],
+)
+def test_clauses_are_dropped_up_to_the_last_resolution(sentence, active, unresolved):
+    assert fake_mod._active_sentence(sentence) == active
+    assert fake_mod._unresolved_sentence(sentence) == (sentence if unresolved is None else unresolved)
