@@ -6,10 +6,13 @@ from typing import Literal, get_args
 Status = Literal["pending", "classified", "failed"]
 Category = Literal["billing", "technical", "account", "other"]
 Priority = Literal["low", "medium", "high"]
+# Which terminal tickets POST /tickets/reclassify puts back in the queue.
+Selector = Literal["failed", "outdated_prompt"]
 
 STATUSES: tuple[Status, ...] = get_args(Status)
 CATEGORIES: tuple[Category, ...] = get_args(Category)
 PRIORITIES: tuple[Priority, ...] = get_args(Priority)
+SELECTORS: tuple[Selector, ...] = get_args(Selector)
 
 
 @dataclass(frozen=True, slots=True)

@@ -5,12 +5,13 @@ Timestamps are bound as ``format_ts`` strings, never as ``datetime`` objects
 """
 
 import sqlite3
+from collections.abc import Collection
 from contextlib import closing
 from datetime import timedelta
 
 from app.clock import Clock, format_ts
 from app.db import Database
-from app.models import Category, Priority, Ticket
+from app.models import SELECTORS, Category, Priority, Selector, Ticket
 from app.validation import Accepted
 
 # Same order as the table and as the Ticket fields; a test keeps the three in sync.
@@ -61,6 +62,21 @@ _FAILED_SQL = (
     f"last_error = :code, {_FLAG_MERGE}, updated_at = :now" + _GUARD
 )
 
+# Operator requeue (#11). One statement, so a row is either reset or claimed, never both: SQLite holds
+# the write lock for the whole UPDATE. Only terminal rows match, so a pending row (in flight or waiting
+# for its backoff) is never touched. prompt_version is cleared too: it is null until a ticket is
+# classified, and the labels it described are gone.
+_REQUEUE_SET = (
+    "UPDATE tickets SET status = 'pending', attempts = 0, category = NULL, priority = NULL, "
+    "summary = NULL, flagged = 0, flag_reason = NULL, last_error = NULL, next_attempt_at = NULL, "
+    "claimed_at = NULL, prompt_version = NULL, updated_at = :now"
+)
+# IS NOT is null-safe: a classified row with no version counts as outdated.
+_SELECTOR_SQL: dict[Selector, str] = {
+    "failed": "status = 'failed'",
+    "outdated_prompt": "(status = 'classified' AND prompt_version IS NOT :current)",
+}
+
 
 def ticket_from_row(row: sqlite3.Row) -> Ticket:
     values = dict(row)
@@ -96,6 +112,19 @@ def _list_query(
     where = f" WHERE {' AND '.join(clauses)}" if clauses else ""
     params.append(limit)
     return f"SELECT {_COLUMNS} FROM tickets{where} ORDER BY created_at, id LIMIT ?", params
+
+
+def _requeue_query(selectors: Collection[Selector]) -> str:
+    """Build the requeue statement. Pure, so tests can EXPLAIN exactly what runs."""
+    chosen = frozenset(selectors)
+    if not chosen:
+        raise ValueError("at least one selector is required")
+    unknown = chosen - set(SELECTORS)
+    if unknown:
+        raise ValueError(f"unknown selector(s): {sorted(unknown)}")
+    # Fixed order, so the SQL text is the same whatever the input order.
+    where = " OR ".join(_SELECTOR_SQL[s] for s in SELECTORS if s in chosen)
+    return f"{_REQUEUE_SET} WHERE {where}"
 
 
 class Repository:
@@ -174,6 +203,19 @@ class Repository:
         """Release every live claim; returns how many. Startup only: assumes no other process holds one."""
         with self._db.connection() as conn:
             return conn.execute(_RELEASE_CLAIMS_SQL, {"now": self._now()}).rowcount
+
+    def requeue(self, selectors: Collection[Selector], *, current_prompt_version: str) -> int:
+        """Reset every failed and/or outdated classified ticket to pending; returns how many.
+
+        One UPDATE: a row is reset or claimed, never both. Pending rows are never touched.
+        ``:current`` is bound even when only ``failed`` is selected; sqlite3 ignores unused names.
+        """
+        if not isinstance(current_prompt_version, str) or not current_prompt_version:
+            raise ValueError(f"current_prompt_version must be a non-empty string, got {current_prompt_version!r}")
+        sql = _requeue_query(selectors)
+        params = {"now": self._now(), "current": current_prompt_version}
+        with self._db.connection() as conn:
+            return conn.execute(sql, params).rowcount
 
     def finish_classified(self, id: str, *, token: str, result: Accepted, prompt_version: str) -> bool:
         """Store an accepted classification. False when the claim ``token`` is no longer live."""
