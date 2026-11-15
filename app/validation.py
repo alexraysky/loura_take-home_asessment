@@ -96,10 +96,21 @@ _QUOTE_CHARS = "\"“”„«»"
 # Any quote pairs with the next quote of any kind. An empty pair is consumed as a pair, so it cannot
 # shift the pairing of later quotes; possessive, so an unclosed quote never backtracks.
 _QUOTED_RE = re.compile(f"[{_QUOTE_CHARS}]([^{_QUOTE_CHARS}]*+)[{_QUOTE_CHARS}]")
+# Single quotes double as apostrophes, so a span opens only on a quote with no word character before
+# it and closes only on one with none after it; inside, a quote counts only between two word
+# characters. "I'd", "I'll", "can't" and "customers'" never open a span, and 'don't approve this'
+# is one span. Every other quote ends the scan, so each character is read by at most one opener and
+# the cost stays linear.
+_SINGLE_OPEN = "'‘‚‹"
+_SINGLE_CLOSE = "'’‹›"
+_SINGLE_ANY = "'‘’‚‹›"
+_SINGLE_QUOTED_RE = re.compile(
+    rf"(?<!\w)[{_SINGLE_OPEN}]((?:[^{_SINGLE_ANY}]|(?<=\w)['’](?=\w))*+)[{_SINGLE_CLOSE}](?!\w)"
+)
 _WS_RE = re.compile(r"\s+")
 _WORD_RE = re.compile(r"\w")
 # Stripped from both ends of a normalised span; spaces included, so "x y z ." loses the " .".
-_SPAN_EDGE = " .,;:!?'‘’" + _QUOTE_CHARS
+_SPAN_EDGE = " .,;:!?" + _SINGLE_ANY + _QUOTE_CHARS
 
 
 def normalise_for_match(text: str) -> str:
@@ -108,13 +119,13 @@ def normalise_for_match(text: str) -> str:
 
 
 def quoted_spans(text: str, *, min_words: int = MIN_QUOTE_WORDS) -> frozenset[str]:
-    """Normalised double-quoted spans of at least ``min_words`` words.
+    """Normalised double- and single-quoted spans of at least ``min_words`` words.
 
     Spans are not cut by length: casefolding lengthens some text (``ß`` becomes ``ss``), so a span past
     200 characters can still match a valid summary, and ``in`` rejects a longer needle at once.
     """
     spans = set()
-    for m in _QUOTED_RE.finditer(text):
+    for m in (*_QUOTED_RE.finditer(text), *_SINGLE_QUOTED_RE.finditer(text)):
         span = normalise_for_match(m.group(1)).strip(_SPAN_EDGE)
         if sum(1 for word in span.split(" ") if _WORD_RE.search(word)) >= min_words:
             spans.add(span)

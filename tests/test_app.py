@@ -20,6 +20,7 @@ from app.llm import FakeLLM, Mode
 from app.main import create_app
 from app.repository import Repository
 from app.worker import WorkerPool
+from tests.sample_data import TICKET_PAYLOADS
 
 
 class Item(BaseModel):
@@ -252,11 +253,7 @@ def test_in_memory_db_path_fails_at_create_app(db_path):
 
 # Model client and workers.
 
-T1001 = {
-    "id": "t-1001",
-    "subject": "Charged twice this month",
-    "body": "Hi, I see two charges on my card for this month. Can you refund one of them?",
-}
+T1001 = TICKET_PAYLOADS[0]
 DEADLINE_S = 5.0
 
 

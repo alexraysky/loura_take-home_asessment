@@ -461,10 +461,11 @@ _DENIED_RECOVERY = (
 )
 _ACTIVE_STATE_RE = _cues(
     r"(?:am|is|are|'m|'s|'re|has been|have been|'ve been) (?:still |currently |completely |totally )?"
-    r"(?:down|broken|unavailable|failing|crashing|offline|locked out|blocked|degraded|compromised"
+    r"(?:down|broken|unavailable|failing|crashing|offline|locked out|blocked|blocking|degraded|compromised"
     r"|returning|throwing|losing|unable|not working|affected|impacted|slow|timing out|lagging|hanging"
-    r"|freezing|stuck|unreachable|inaccessible)",
+    r"|freezing|stuck|unreachable|inaccessible|empty)",
     *_DENIED_RECOVERY,
+    "contains nothing",
     "returns?",
     "throws?",
     "fails?",
@@ -544,8 +545,9 @@ _BLOCKED_RE = _cues(
     "cannot",
     "unable",
     "not able",
-    "blocked",
+    "block(?:ed|ing)",
     "locked out",
+    "invalid (?:credentials|password|login)",
     "not working",
     "doesn'?t work",
     "does not work",
@@ -555,6 +557,9 @@ _BLOCKED_RE = _cues(
     _ERROR,
     "crash(?:es|ed)?",
     "won'?t",
+    # An empty result is a failed export or download; "the file is not empty" never matches.
+    "contains nothing",
+    r"(?:export|file|zip|archive|report|download)s?(?: (?:is|are|was|were|came back))? empty",
     # Lost ability only: "I am no longer locked out." is resolved, not blocked.
     r"no longer (?:works?|working|able|lets?|allows?|loads?|loading|connects?|responds?|syncs?|syncing|runs?"
     r"|running|accepts?|sends?|sending|opens?|log ?in|sign ?in|access)",
