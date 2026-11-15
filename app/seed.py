@@ -96,7 +96,8 @@ def check_base_url(url: str) -> str:
     ``file:`` is refused because ``urlopen`` would read a local file. A path prefix is kept
     (``http://host/api`` posts to ``/api/tickets``), a query or fragment is refused, and so are
     credentials, which would end up in the output; they are checked first, so no other message
-    echoes them. A host must be valid IDNA and a path ASCII, or the request would fail to encode.
+    echoes them. A host must be valid IDNA and a path ASCII, or the request would fail to encode;
+    an internationalised host is returned in its ASCII (punycode) form, which the Host header needs.
     """
     if any(ch.isspace() or _is_unsafe(ch) for ch in url):
         raise ValueError("--base-url must not contain whitespace or control characters")
@@ -107,7 +108,7 @@ def check_base_url(url: str) -> str:
     if parts.username is not None or parts.password is not None:
         raise ValueError("--base-url must not contain credentials")
     try:
-        _ = parts.port  # ValueError for a port that is not a number in range
+        port = parts.port  # ValueError for a port that is not a number in range
     except ValueError:
         raise ValueError(f"--base-url is not a valid URL: {url!r}") from None
     if parts.scheme not in ("http", "https"):
@@ -117,14 +118,21 @@ def check_base_url(url: str) -> str:
     if parts.query or parts.fragment:
         raise ValueError(f"--base-url must not have a query or fragment: {url!r}")
     try:
-        parts.hostname.encode("idna")
+        encoded_host = parts.hostname.encode("idna").decode("ascii")
     except UnicodeError:
         raise ValueError(f"--base-url has an invalid host: {url!r}") from None
     try:
         parts.path.encode("ascii")
     except UnicodeError:
         raise ValueError(f"--base-url path must be ASCII (percent-encode it): {url!r}") from None
-    return urllib.parse.urlunsplit((parts.scheme, parts.netloc, parts.path.rstrip("/"), "", ""))
+    if not parts.hostname.isascii():
+        host = encoded_host
+    elif parts.netloc.startswith("["):
+        host = parts.netloc[: parts.netloc.index("]") + 1]  # an IPv6 literal, kept in its brackets
+    else:
+        host = parts.netloc.partition(":")[0]  # as typed: ``hostname`` would lowercase it
+    netloc = f"{host}:{port}" if port is not None else host
+    return urllib.parse.urlunsplit((parts.scheme, netloc, parts.path.rstrip("/"), "", ""))
 
 
 def build_parser() -> argparse.ArgumentParser:

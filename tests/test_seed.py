@@ -228,8 +228,54 @@ def test_credentials_are_never_echoed(capsys, server, url):
     assert server.received == []
 
 
-def test_check_base_url_accepts_an_idna_host():
-    assert seed.check_base_url("http://bücher.example/api") == "http://bücher.example/api"
+@pytest.mark.parametrize(
+    ("url", "expected"),
+    [
+        ("http://例子.example", "http://xn--fsqu00a.example"),
+        ("http://bücher.example:8766/api/", "http://xn--bcher-kva.example:8766/api"),
+        ("http://Bücher.example", "http://xn--bcher-kva.example"),
+        ("http://[::1]:8080/", "http://[::1]:8080"),
+        ("http://[::1]:8000", "http://[::1]:8000"),
+        ("http://h:", "http://h"),
+    ],
+)
+def test_check_base_url_returns_an_ascii_host(url, expected):
+    assert seed.check_base_url(url) == expected
+
+
+IDN_HOST, IDN_ASCII = "例子.example", "xn--fsqu00a.example"
+
+
+@pytest.fixture
+def idn_resolves_locally(monkeypatch):
+    """Resolve the punycode form of IDN_HOST to 127.0.0.1; any other name fails to resolve."""
+    real = socket.getaddrinfo
+
+    def getaddrinfo(host, *args, **kwargs):
+        if host != IDN_ASCII:
+            raise socket.gaierror(socket.EAI_NONAME, "not resolvable in this test")
+        return real("127.0.0.1", *args, **kwargs)
+
+    monkeypatch.setattr(socket, "getaddrinfo", getaddrinfo)
+
+
+def test_idna_host_is_sent_in_ascii(capsys, server, tmp_path, idn_resolves_locally):
+    port = server.server_address[1]
+    path = str(tickets_file(tmp_path, TWO[:1]))
+    code, out, err = run_seed(capsys, "--base-url", f"http://{IDN_HOST}:{port}", "--file", path)
+    assert (code, err) == (0, "")
+    assert out.splitlines()[0] == "t-1 202 Accepted"
+    [received] = server.received
+    assert received.headers["host"] == f"{IDN_ASCII}:{port}"
+
+
+def test_idna_host_unreachable_names_the_ascii_url(capsys, idn_resolves_locally):
+    code, out, err = run_seed(capsys, "--base-url", f"http://{IDN_HOST}:{closed_port()}", "--timeout", "2")
+    assert code == 1
+    [line] = out.splitlines()
+    assert line.startswith(f"t-1001 error: could not reach http://{IDN_ASCII}:")
+    assert "UnicodeEncodeError" not in out + err
+    assert err == "seed: is the server running? try: make run\n"
 
 
 @pytest.mark.parametrize(
