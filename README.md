@@ -139,7 +139,9 @@ The cursor is the position of the last item returned (`created_at` and `id`), no
 ### `POST /tickets/reclassify`
 
 ```sh
-curl -i -X POST http://127.0.0.1:8000/tickets/reclassify \n  -H 'content-type: application/json' \n  -d '{"select": ["failed", "outdated_prompt"]}'
+curl -i -X POST http://127.0.0.1:8000/tickets/reclassify \
+  -H 'content-type: application/json' \
+  -d '{"select": ["failed", "outdated_prompt"]}'
 ```
 
 Puts finished tickets back in the queue, for example after a prompt change or once the model is reachable again. `select` is a required list of one or both selectors, none repeated:

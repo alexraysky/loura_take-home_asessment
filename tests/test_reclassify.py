@@ -16,8 +16,8 @@ from app.models import SELECTORS
 from app.prompt import PROMPT_VERSION
 from app.repository import Repository
 from app.validation import FLAG_REASON_ECHO
-from conftest import GateLLM, wait_for_status, wait_until
 from tests.sample_data import EXPECTED, SAMPLE_TICKETS, TICKET_PAYLOADS
+from tests.workers import GateLLM, wait_for_status, wait_until
 
 NOT_FOUND = {"error": {"code": "ticket_not_found", "message": "Ticket not found.", "details": None}}
 

@@ -19,8 +19,8 @@ from app.llm import FakeLLM, Mode
 from app.main import create_app
 from app.repository import Repository
 from app.worker import WorkerPool
-from conftest import GateLLM, wait_for_status, wait_until
 from tests.sample_data import TICKET_PAYLOADS
+from tests.workers import GateLLM, wait_for_status, wait_until
 
 
 class Item(BaseModel):
