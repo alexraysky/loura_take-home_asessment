@@ -12,9 +12,9 @@ import logging
 import re
 import unicodedata
 from dataclasses import dataclass, field
-from typing import Any, Literal, NoReturn, get_args
+from typing import Annotated, Any, Literal, NoReturn, get_args
 
-from pydantic import BaseModel, ConfigDict, Field, ValidationError
+from pydantic import AfterValidator, BaseModel, ConfigDict, Field, ValidationError
 
 from app.models import Category, Priority
 
@@ -68,6 +68,16 @@ class Rejected:
 ValidationResult = Accepted | Rejected
 
 
+def _clean_flag_reason(value: str | None) -> str | None:
+    """Trimmed, blank as None; a line break or ``C*`` character fails inside the schema."""
+    if value is None:
+        return None
+    value = value.strip()
+    if not _is_clean_line(value):
+        raise ValueError("flag_reason must be one line without control characters")
+    return value or None
+
+
 class _ModelOutput(BaseModel):
     model_config = ConfigDict(strict=True, extra="forbid")
 
@@ -76,15 +86,16 @@ class _ModelOutput(BaseModel):
     # No length constraint: a bad summary is rule 4's summary_invalid, not a schema violation.
     summary: str
     flagged: bool
-    # Required key, nullable.
-    flag_reason: str | None = Field(max_length=MAX_FLAG_REASON_CHARS)
+    # Required key, nullable. Cleanliness is checked here so it is a schema error even beside a bad enum.
+    flag_reason: Annotated[str | None, Field(max_length=MAX_FLAG_REASON_CHARS), AfterValidator(_clean_flag_reason)]
 
 
 # A terminator, optional closing quotes or brackets, whitespace, then more text.
 _MULTI_SENTENCE_RE = re.compile(r"[.!?]+[\"'”’)\]]*\s+\S")
 _QUOTE_CHARS = "\"“”„«»"
-# Any quote pairs with the next quote of any kind; possessive, so an unclosed quote never backtracks.
-_QUOTED_RE = re.compile(f"[{_QUOTE_CHARS}]([^{_QUOTE_CHARS}]++)[{_QUOTE_CHARS}]")
+# Any quote pairs with the next quote of any kind. An empty pair is consumed as a pair, so it cannot
+# shift the pairing of later quotes; possessive, so an unclosed quote never backtracks.
+_QUOTED_RE = re.compile(f"[{_QUOTE_CHARS}]([^{_QUOTE_CHARS}]*+)[{_QUOTE_CHARS}]")
 _WS_RE = re.compile(r"\s+")
 _WORD_RE = re.compile(r"\w")
 # Stripped from both ends of a normalised span; spaces included, so "x y z ." loses the " .".
@@ -97,12 +108,14 @@ def normalise_for_match(text: str) -> str:
 
 
 def quoted_spans(text: str, *, min_words: int = MIN_QUOTE_WORDS) -> frozenset[str]:
-    """Normalised double-quoted spans of at least ``min_words`` words that could fit in a summary."""
+    """Normalised double-quoted spans of at least ``min_words`` words.
+
+    Spans are not cut by length: casefolding lengthens some text (``ß`` becomes ``ss``), so a span past
+    200 characters can still match a valid summary, and ``in`` rejects a longer needle at once.
+    """
     spans = set()
     for m in _QUOTED_RE.finditer(text):
         span = normalise_for_match(m.group(1)).strip(_SPAN_EDGE)
-        if len(span) > MAX_SUMMARY_CHARS:
-            continue
         if sum(1 for word in span.split(" ") if _WORD_RE.search(word)) >= min_words:
             spans.add(span)
     return frozenset(spans)
@@ -133,10 +146,6 @@ def _validate(text: str, subject: str, body: str) -> ValidationResult:
         kinds = {e["type"] for e in exc.errors(include_url=False, include_context=False, include_input=False)}
         return Rejected("value_out_of_set" if kinds == {"literal_error"} else "schema_violation")
 
-    flag_reason = None if out.flag_reason is None else out.flag_reason.strip()
-    if flag_reason is not None and not _is_clean_line(flag_reason):
-        return Rejected("schema_violation")
-
     summary = out.summary.strip()
     if (
         not 1 <= len(summary) <= MAX_SUMMARY_CHARS
@@ -154,7 +163,7 @@ def _validate(text: str, subject: str, body: str) -> ValidationResult:
         priority=out.priority,
         summary=summary,
         flagged=out.flagged,
-        flag_reason=flag_reason or None,
+        flag_reason=out.flag_reason,
     )
 
 
