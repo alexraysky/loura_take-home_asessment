@@ -81,7 +81,9 @@ FLAG_REASON_INJECTION = "Ticket text addresses the classifier."
 # Coupled with app/prompt.py: the boundary tag is ``ticket-`` plus alphanumerics of any length.
 # Only the outermost pair counts, closed with the same nonce; tags inside the ticket are text.
 _WRAPPER_RE = re.compile(r"\s*<ticket-([A-Za-z0-9]+)>(.*)</ticket-\1>\s*", re.S)
-_FIELDS_RE = re.compile(r"\s*<subject>(.*?)</subject>\s*<body>(.*)</body>\s*", re.S)
+# Atomic: only the first "</subject><body>" can end the subject, so a message without a closing
+# "</body>" fails in one pass instead of rescanning the body from every later candidate.
+_FIELDS_RE = re.compile(r"\s*<subject>(?>(.*?)</subject>\s*<body>)(.*)</body>\s*", re.S)
 _WS_RE = re.compile(r"\s+")
 _QUOTED_LINE_RE = re.compile(r"^[ \t]*>.*$", re.M)
 # A single line break is a soft wrap, not a sentence end; a blank line is.
@@ -398,13 +400,35 @@ _SOFT_SEPARATORS = frozenset(",;:")
 # "How can I avoid asking for help with an outage?" still asks about the outage.
 _QUALIFIER_RE = re.compile(f"{_CLAUSE_SPLIT_RE.pattern}|{_HYPOTHETICAL_RE.pattern}")
 # A past incident mentioned before a question is context, not a report: "We had an outage last
-# year; how do I get the SLA report?". Wording that says it is still going on keeps it a report.
+# year; how do I get the SLA report?", "We had an outage yesterday.". Wording that says it is still
+# going on keeps it a report. Hours are left out: "The dashboard went down an hour ago." is ongoing.
 _PAST_RE = _cues(
-    "last (?:year|month|week|quarter)",
-    r"(?:\w+ )?(?:weeks|months|years) ago",
+    "last (?:year|month|week|quarter|night)",
+    "yesterday",
+    "this morning",
+    "earlier today",
+    r"(?:\w+ )?(?:days|weeks|months|years) ago",
     r"in 20\d\d",
 )
-_ONGOING_RE = _cues("still", "now", "currently", "again", "ongoing", "since", "today")
+# A recovered state ("is fine now", "working again") says the problem is over, so its "now" or
+# "again" is not ongoing wording.
+_RECOVERED = "fine|fixed|resolved|restored|recovered|working|up|online|ok|okay"
+_NOT_RECOVERED = "".join(rf"(?<!\b{word} )" for word in _RECOVERED.split("|"))
+_ONGOING_RE = _cues(
+    "still",
+    f"{_NOT_RECOVERED}now",
+    "currently",
+    f"{_NOT_RECOVERED}again",
+    "ongoing",
+    "since",
+    "(?<!earlier )today",
+)
+_RESOLVED_RE = _cues(
+    rf"(?:{_RECOVERED}) (?:now|again)",
+    r"(?:is|are|'s|'re|was|were|has been|have been|got) (?:fixed|resolved|restored|recovered)",
+    r"(?:is|are|'s|'re|came|come|comes) back (?:up|online)",
+    r"no longer (?:down|broken|failing|offline|unavailable|locked out|blocked|affected|impacted|an issue|a problem)",
+)
 # A present-tense problem state is going on now, whatever past change caused it: "Our API is down
 # after last week's release.", "All users are locked out after last week's upgrade." The past
 # tense ("We had an outage", "Our API went down last month") stays historical.
@@ -499,7 +523,9 @@ _BLOCKED_RE = _cues(
     _ERROR,
     "crash(?:es|ed)?",
     "won'?t",
-    "no longer",
+    # Lost ability only: "I am no longer locked out." is resolved, not blocked.
+    r"no longer (?:works?|working|able|lets?|allows?|loads?|loading|connects?|responds?|syncs?|syncing|runs?"
+    r"|running|accepts?|sends?|sending|opens?|log ?in|sign ?in|access)",
     "(?:trouble|problems?|difficulty) (?:logging|signing) (?:in|on)",
 )
 _DOUBLE_CHARGE_RE = _cues("charged twice", "two charges", "double charge[d]?", "duplicate charge")
@@ -602,13 +628,16 @@ _ASSERTED_CLAUSE_RE = re.compile(
     re.S,
 )
 # Negation right before an impact cue denies it: "There is no outage.", "We did not experience an
-# outage.", "There is no outage or data loss." It must end where the cue starts, so "Not sure if
+# outage.", "There is no outage or data loss.", "Nobody is locked out.", "None of our users are
+# locked out.", "I am no longer locked out." It must end where the cue starts, so "Not sure if
 # anyone noticed the API is down." and "No, the API is down." still report the problem. Searched
 # only in a bounded window before each match, so the check costs the same for any body length.
 _NEGATION_WINDOW = 60
 _NEGATED_RE = re.compile(
-    r"(?:\b(?:no|not|never|without|zero|neither|nor)|n't)"
-    r"(?: (?:be|been|being|have|had|has|having|see|seen|seeing|experience[sd]?|experiencing))?"
+    r"(?:\b(?:no(?: longer)?|not|never|without|zero|neither|nor|nobody|no one"
+    r"|none(?: of (?:us|them|(?:our|the|my|these|those) \w+))?)"
+    r"(?: (?:on|in|from) (?:our|the|my) \w+)?|n't)"
+    r"(?: (?:am|is|are|was|were|be|been|being|have|had|has|having|see|seen|seeing|experience[sd]?|experiencing))?"
     r"(?: (?:a|an|the|any|more|further|single|real|actual|confirmed|ongoing|active|reported|production|security))*"
     r"(?: \w+(?: \w+)? (?:or|nor))?"
     r" \Z"
@@ -660,6 +689,8 @@ _SUMMARIES = {
     ("account", "medium"): "Customer cannot access their account and needs it restored.",
     ("account", "low"): "Customer asks how to change an account setting.",
     ("technical", "medium"): "Customer reports an error that blocks their work.",
+    # Slowness or timeouts with nothing blocked: "The dashboard is slow."
+    ("technical", "degraded"): "Customer reports degraded performance that affects their work.",
     ("technical", "low"): "Customer asks a technical question with no time pressure.",
     ("other", "low"): "Customer sent a message that does not fit a specific category.",
 }
@@ -734,21 +765,22 @@ class FakeLLM:
         self._calls_by_key[key] = n + 1
         # The fake does no I/O; yielding lets concurrent workers interleave here.
         await asyncio.sleep(0)
-        mode = self._choose_mode(key, n, user)
+        ticket = _split_ticket(user)
+        mode = self._choose_mode(key, n, ticket)
         self._total_calls += 1
         if self.max_recorded_calls > 0:
             if len(self.calls) >= self.max_recorded_calls:
                 del self.calls[0]
             self.calls.append(Call(system, user, mode))
         log.debug("fake llm call %d for prompt %s: %s", n, key[:12], mode)
-        return self._render(mode, key, n, user)
+        return self._render(mode, key, n, ticket)
 
-    def _choose_mode(self, key: str, n: int, user: str) -> Mode:
+    def _choose_mode(self, key: str, n: int, ticket: tuple[str, str]) -> Mode:
         if self._script is not None:
             if not self._script:
                 raise RuntimeError(f"FakeLLM script exhausted after {self._total_calls} calls")
             return self._script.popleft()
-        if self.gullible and n == 0 and _is_injected(*_split_ticket(user)):
+        if self.gullible and n == 0 and _is_injected(*ticket):
             return Mode.HIJACKED
         d = self._draw(key, n)
         if int.from_bytes(d[0:8], "big") / 2**64 < self.failure_rate:
@@ -759,14 +791,14 @@ class FakeLLM:
         # Never hash(): str hashing is salted per process.
         return hashlib.sha256(f"{self.seed}:{n}:{key}".encode("ascii")).digest()
 
-    def _render(self, mode: Mode, key: str, n: int, user: str) -> str:
+    def _render(self, mode: Mode, key: str, n: int, ticket: tuple[str, str]) -> str:
         if mode is Mode.TIMEOUT:
             raise LLMTimeout("fake model timed out")
         if mode is Mode.UNAVAILABLE:
             raise LLMUnavailable("fake model unavailable")
         if mode is Mode.HIJACKED:
             return _dumps(HIJACKED_ANSWER)
-        answer = classify_text(*_split_ticket(user))
+        answer = classify_text(*ticket)
         d = self._draw(key, n)
         match mode:
             case Mode.OK:
@@ -862,6 +894,7 @@ def classify_text(subject: str, body: str) -> dict[str, Any]:
         deadline=deadline,
         feature=feature,
         impaired=impaired,
+        blocked=blocked,
     )
     return {
         "category": category,
@@ -886,6 +919,7 @@ def _summary_for(
     deadline: bool,
     feature: bool,
     impaired: bool,
+    blocked: bool,
 ) -> str:
     # Templates only, never ticket text, so a summary can not echo or obey the ticket. The flags
     # are the ones that set the priority, so a summary never states what the ticket only asks about.
@@ -914,6 +948,8 @@ def _summary_for(
     # A deadline alone raises an account or technical request with nothing broken: "Please add a
     # seat to my account by Friday." must not read as a lockout or a blocking error.
     if priority == "medium":
+        if impaired and category == "technical" and not blocked:
+            return _SUMMARIES[("technical", "degraded")]
         if impaired:
             return _SUMMARIES[(category, "medium")]
         if deadline:
@@ -943,17 +979,23 @@ def _is_question(sentence: str) -> bool:
     return sentence.endswith("?") or bool(_HOWTO_RE.search(sentence) or _QUESTION_RE.search(sentence))
 
 
-def _reports_high_impact(sentence: str) -> bool:
-    """Whether the sentence reports impact that makes a ticket high on its own."""
-    # "We had a production outage last year; how do I get the SLA report?" and "We had an outage
-    # last year." mention a past incident; wording that says it is still going on, or a present-tense
-    # problem state ("Our API is down after last week's release."), keeps it a report.
+def _is_past_or_resolved(sentence: str) -> bool:
+    """Whether the reported part of the sentence tells of a problem that is over."""
+    # "We had a production outage last year; how do I get the SLA report?", "Our site was down
+    # yesterday but is fine now." and "Fixed now - our dashboard is back up." mention a past or
+    # resolved problem; wording that says it is still going on, or a present-tense problem state
+    # ("Our API is down after last week's release."), keeps it a report.
     reported = _reported_part(sentence)
-    if (
-        _PAST_RE.search(reported)
+    return (
+        bool(_PAST_RE.search(reported) or _RESOLVED_RE.search(reported))
         and not _ONGOING_RE.search(reported)
         and not _ACTIVE_STATE_RE.search(reported)
-    ):
+    )
+
+
+def _reports_high_impact(sentence: str) -> bool:
+    """Whether the sentence reports impact that makes a ticket high on its own."""
+    if _is_past_or_resolved(sentence):
         return False
     return (
         _reports_incident(sentence)
@@ -966,7 +1008,7 @@ def _reports_high_impact(sentence: str) -> bool:
 def _reports_blocker(sentence: str) -> bool:
     # "I am locked out." reports a blocker, "What happens if all users are locked out?" asks about one.
     # "How do I handle errors in the API?" asks about errors; only wording before a how-to counts.
-    return _states(_BLOCKED_RE, sentence, reported=True)
+    return not _is_past_or_resolved(sentence) and _states(_BLOCKED_RE, sentence, reported=True)
 
 
 def _is_production_failure(sentence: str) -> bool:
@@ -1049,7 +1091,7 @@ def _reported_part(sentence: str) -> str:
 def _reports_incident(sentence: str) -> bool:
     # "Our production API is down. What should we do?" reports an outage; "How do we handle a
     # production outage?", "How do I avoid an outage?" and "What happens if our site goes down?" ask
-    # about one. Past incidents are filtered in _reports_high_impact.
+    # about one. Past and resolved incidents are filtered in _is_past_or_resolved.
     return _states(_INCIDENT_RE, sentence, reported=True)
 
 
@@ -1136,7 +1178,7 @@ def _states(
 
 
 def _reports_degradation(sentence: str) -> bool:
-    return _states(_DEGRADED_RE, sentence, reported=True)
+    return not _is_past_or_resolved(sentence) and _states(_DEGRADED_RE, sentence, reported=True)
 
 
 def _reports_money_owed(sentence: str) -> bool:

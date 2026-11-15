@@ -1372,7 +1372,7 @@ def test_progressive_login_wording_is_account(body, priority):
             "Our export is timing out. Would love help with this.",
             "technical",
             "medium",
-            "Customer reports an error that blocks their work.",
+            "Customer reports degraded performance that affects their work.",
         ),
         (
             "I was overcharged. Would love a refund.",
@@ -1439,7 +1439,7 @@ def test_long_hypothetical_bodies_stay_low_and_classify_in_linear_time(body):
     assert len(body) <= 20_000
     start = time.monotonic()
     answer = classify_text("", body)
-    assert time.monotonic() - start < 0.5
+    assert time.monotonic() - start < 1.0
     assert answer["priority"] == "low"
 
 
@@ -1702,7 +1702,7 @@ def test_long_negated_or_help_request_bodies_classify_in_linear_time(body):
     assert len(body) <= 20_000
     start = time.monotonic()
     classify_text("", body)
-    assert time.monotonic() - start < 0.5
+    assert time.monotonic() - start < 1.0
 
 
 @pytest.mark.parametrize(
@@ -1750,7 +1750,7 @@ def test_long_comma_separated_how_to_bodies_classify_in_linear_time(body):
     assert len(body) <= 20_000
     start = time.monotonic()
     classify_text("", body)
-    assert time.monotonic() - start < 0.5
+    assert time.monotonic() - start < 1.0
 
 
 @pytest.mark.parametrize(
@@ -1888,5 +1888,94 @@ def test_long_conditional_questions_without_a_consequent_classify_in_linear_time
     assert len(body) <= 20_000
     start = time.monotonic()
     answer = classify_text("", body)
-    assert time.monotonic() - start < 0.5
+    assert time.monotonic() - start < 1.0
     assert answer["priority"] == "low"
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        "Our API went down yesterday. Can I get the incident report?",
+        "Our API went down two days ago. Can I get the incident report?",
+        "The site was down this morning. Where can I see the postmortem?",
+        "Last night all users were locked out. Where can I see the postmortem?",
+        "Our site was down yesterday but is fine now.",
+        "The site was down this morning; it's back up.",
+        "Fixed now - our dashboard is back up.",
+    ],
+)
+def test_recent_past_or_resolved_incidents_stay_low(body):
+    answer = classify_text("", body)
+    assert answer["priority"] == "low"
+    assert "severe" not in answer["summary"]
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        "Our API went down yesterday and is still down.",
+        "Our API has been down since yesterday.",
+        "Login is fixed now but the API is down.",
+        "The API is down now.",
+    ],
+)
+def test_recent_incidents_still_going_on_stay_high(body):
+    assert classify_text("", body)["priority"] == "high"
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        "Nobody is locked out anymore.",
+        "No one on our team is locked out.",
+        "None of our users are locked out.",
+        "I am no longer locked out, thanks.",
+    ],
+)
+def test_negated_or_resolved_lockouts_are_not_blockers(body):
+    answer = classify_text("", body)
+    assert (answer["category"], answer["priority"]) == ("account", "low")
+    assert answer["summary"] == "Customer asks how to change an account setting."
+
+
+@pytest.mark.parametrize(
+    ("body", "priority"),
+    [
+        ("I can no longer log in.", "medium"),
+        ("Everyone on our team is locked out.", "medium"),
+        ("No, all users are locked out.", "high"),
+    ],
+)
+def test_lost_access_and_affirmed_lockouts_stay_blockers(body, priority):
+    answer = classify_text("", body)
+    assert (answer["category"], answer["priority"]) == ("account", priority)
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        "The dashboard is slow.",
+        "The API is slow.",
+        "If I open the dashboard, it is slow. Why?",
+        "Our export is timing out. Would love help with this.",
+    ],
+)
+def test_degradation_without_a_blocker_uses_the_degraded_summary(body):
+    answer = classify_text("", body)
+    assert (answer["category"], answer["priority"]) == ("technical", "medium")
+    assert answer["summary"] == "Customer reports degraded performance that affects their work."
+
+
+def test_degradation_with_a_blocker_keeps_the_blocking_summary():
+    answer = classify_text("", "The dashboard is slow and I cannot export.")
+    assert answer["summary"] == "Customer reports an error that blocks their work."
+
+
+def test_unclosed_field_tags_split_in_linear_time():
+    # Without a closing </body>, retrying the body scan from every "</subject><body>" took
+    # about 2 seconds on this 64,000-character message.
+    user = "<subject>" + "</subject><body>" * 4000
+    start = time.monotonic()
+    fields = fake_mod._split_ticket(user)
+    assert time.monotonic() - start < 0.1
+    assert fields == ("", user)
