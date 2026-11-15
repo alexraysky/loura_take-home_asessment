@@ -2187,3 +2187,69 @@ def test_anaphoric_recovery_resolves_the_earlier_problem(body, expected):
 )
 def test_resolution_drops_only_the_clauses_it_resolves(sentence, unresolved):
     assert fake_mod._unresolved_sentence(sentence) == unresolved
+
+
+@pytest.mark.parametrize(
+    ("body", "expected"),
+    [
+        ("The API was down. It is fixed now.", ("technical", "low")),
+        ("I was charged twice. It was refunded.", ("billing", "low")),
+        ("The export was broken, but the export is fixed now.", ("technical", "low")),
+        ("The export was broken. The export is fixed now.", ("technical", "low")),
+    ],
+)
+def test_recovery_resolves_the_problem_across_sentences(body, expected):
+    answer = classify_text("", body)
+    assert (answer["category"], answer["priority"]) == expected
+
+
+def test_refund_in_a_later_sentence_leaves_nothing_owed():
+    answer = classify_text("", "I was charged twice. It was refunded.")
+    assert answer["summary"] == "Customer asks a question about billing."
+
+
+@pytest.mark.parametrize(
+    ("body", "expected"),
+    [
+        ("Our API went down this morning. It is not fixed.", ("technical", "high")),
+        ("We found a security breach. The export is fixed now.", ("technical", "high")),
+        ("I was charged twice. My password reset is fixed now.", ("billing", "medium")),
+    ],
+)
+def test_denied_or_unrelated_recovery_in_a_later_sentence_keeps_the_problem(body, expected):
+    answer = classify_text("", body)
+    assert (answer["category"], answer["priority"]) == expected
+
+
+def test_recovery_in_a_later_sentence_resolves_only_the_problem_right_before_it():
+    answer = classify_text("", "We found a security breach. The API was down. It is fixed now.")
+    assert answer["priority"] == "high"
+
+
+def test_long_multi_sentence_recoveries_classify_in_linear_time():
+    body = "The API was down. It is fixed now. " * 570
+    assert len(body) <= 20_000
+    start = time.monotonic()
+    answer = classify_text("", body)
+    assert time.monotonic() - start < 1.0
+    assert answer["priority"] == "low"
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        "I cannot update my email address.",
+        "All users can log in, but I cannot change my email address.",
+        "I cannot invite a team member to our account.",
+    ],
+)
+def test_non_access_account_blocker_gets_a_neutral_summary(body):
+    answer = classify_text("", body)
+    assert (answer["category"], answer["priority"]) == ("account", "medium")
+    assert answer["summary"] == "Customer reports an account problem that blocks their request."
+
+
+def test_account_access_blocker_gets_the_lockout_summary():
+    answer = classify_text("", "I cannot log in to my account.")
+    assert (answer["category"], answer["priority"]) == ("account", "medium")
+    assert answer["summary"] == "Customer cannot access their account and needs it restored."
