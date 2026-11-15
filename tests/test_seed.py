@@ -400,6 +400,46 @@ def test_summary_counts(capsys, server, tmp_path):
     assert out.splitlines()[-1] == "6 tickets: 2 accepted, 2 already stored, 2 other"
 
 
+# The largest body the API accepts, in the widest characters: its echo is far past MAX_ERROR_BYTES.
+EMOJI_TICKET = {"id": "t-1", "subject": "", "body": "\U0001f600" * 20_000}
+
+
+@pytest.mark.parametrize(("ensure_ascii", "floor"), [(False, 80_000), (True, 120 * 1024)], ids=["utf8", "escaped"])
+@pytest.mark.parametrize(
+    ("status", "line"), [(202, "t-1 202 Accepted"), (200, "t-1 200 OK (already stored)")], ids=["202", "200"]
+)
+def test_full_size_ticket_response_counts(capsys, server, tmp_path, ensure_ascii, floor, status, line):
+    payload = json.dumps({**EMOJI_TICKET, "status": "pending"}, ensure_ascii=ensure_ascii).encode()
+    assert len(payload) > max(floor, seed.MAX_ERROR_BYTES)
+    server.reply(Reply(status, payload))
+    path = tickets_file(tmp_path, [EMOJI_TICKET])
+    code, out, err = run_seed(capsys, "--base-url", server.base_url, "--file", str(path))
+    assert (code, err) == (0, "")
+    assert out.splitlines()[0] == line
+
+
+@pytest.mark.parametrize(
+    ("reply", "line"),
+    [
+        (Reply(500, envelope("internal_error", "x" * seed.MAX_ERROR_BYTES)), "t-1 500 Internal Server Error"),
+        (Reply(409, envelope("ticket_conflict", "x" * seed.MAX_ERROR_BYTES)), "t-1 409 Conflict"),
+        (Reply(200, b"<html>" + b"x" * seed.MAX_ERROR_BYTES, "text/html"), "t-1 200 OK (not a ticket response)"),
+        (Reply(200, b"<html>" + b"x" * seed.MAX_TICKET_BYTES, "text/html"), "t-1 200 OK (not a ticket response)"),
+        (
+            Reply(202, json.dumps({"id": "t-1", "body": "x" * seed.MAX_TICKET_BYTES}).encode()),
+            "t-1 202 Accepted (not a ticket response)",
+        ),
+    ],
+    ids=["500-envelope", "409-envelope", "200-html", "200-html-past-ticket-limit", "202-ticket-past-ticket-limit"],
+)
+def test_oversized_responses_are_cut_short(capsys, server, tmp_path, reply, line):
+    # Only a bounded prefix is read, so an oversized body never parses: its code is not trusted.
+    server.reply(reply, Reply(202))
+    code, out, _ = run_seed(capsys, "--base-url", server.base_url, "--file", str(tickets_file(tmp_path, TWO)))
+    assert code == 1
+    assert out.splitlines() == [line, "t-2 202 Accepted", "2 tickets: 1 accepted, 0 already stored, 1 other"]
+
+
 def test_format_line():
     assert seed.format_line(seed.Outcome("t-1", 202, "Accepted", kind="accepted")) == "t-1 202 Accepted"
     assert seed.format_line(seed.Outcome("t-1", 200, "OK", kind="stored")) == "t-1 200 OK (already stored)"
@@ -523,6 +563,18 @@ def test_running_twice_leaves_ten_tickets_and_reports_200(capsys, live_server):
     for item in page["items"]:
         assert item["status"] == "classified", item["id"]
         assert (item["category"], item["priority"], item["flagged"]) == EXPECTED[item["id"]]
+
+
+def test_full_size_emoji_ticket_round_trips(capsys, live_server, tmp_path):
+    # The real API echoes the whole 20,000-emoji body, past MAX_ERROR_BYTES, on both 202 and 200.
+    path = tickets_file(tmp_path, [EMOJI_TICKET])
+    for line, summary in [
+        ("t-1 202 Accepted", "1 tickets: 1 accepted, 0 already stored, 0 other"),
+        ("t-1 200 OK (already stored)", "1 tickets: 0 accepted, 1 already stored, 0 other"),
+    ]:
+        code, out, err = run_seed(capsys, "--base-url", live_server, "--file", str(path))
+        assert (code, err) == (0, "")
+        assert out.splitlines() == [line, summary]
 
 
 def test_module_entry_point():

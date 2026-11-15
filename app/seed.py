@@ -39,7 +39,10 @@ EXIT_USAGE = 2
 TICKET_KEYS = frozenset({"id", "subject", "body"})
 REQUIRED_KEYS = frozenset({"id", "body"})
 # Only so much of a response is read: enough for an error envelope, never a whole HTML page.
-MAX_READ_BYTES = 64 * 1024
+MAX_ERROR_BYTES = 64 * 1024
+# A 200 or 202 echoes the ticket: a legal 20,000-character body is over 80 KB as 4-byte UTF-8
+# emoji, or about 240 KB JSON-escaped as \uXXXX pairs. 512 KiB fits it and still bounds the read.
+MAX_TICKET_BYTES = 512 * 1024
 # An error code is printed only when it looks like one, so a hostile server cannot write to the terminal.
 _CODE_RE = re.compile(r"[A-Za-z0-9_.-]{1,64}")
 
@@ -199,11 +202,13 @@ def post_ticket(base_url: str, ticket: dict[str, str], *, timeout: float) -> Out
     try:
         try:
             with urllib.request.urlopen(request, timeout=timeout) as response:
-                return _outcome(ticket["id"], response.status, response.reason, response.read(MAX_READ_BYTES))
+                ticket_like = response.status in (HTTPStatus.OK, HTTPStatus.ACCEPTED)
+                body = response.read(MAX_TICKET_BYTES if ticket_like else MAX_ERROR_BYTES)
+                return _outcome(ticket["id"], response.status, response.reason, body)
         except urllib.error.HTTPError as exc:
             # Every status urlopen does not return; the context manager closes its socket.
             with exc:
-                return _outcome(ticket["id"], exc.code, exc.reason, exc.read(MAX_READ_BYTES))
+                return _outcome(ticket["id"], exc.code, exc.reason, exc.read(MAX_ERROR_BYTES))
     except (urllib.error.URLError, http.client.HTTPException, OSError) as exc:
         # On Windows a refused local port surfaces as URLError(TimeoutError), so every
         # transport failure is treated alike.
