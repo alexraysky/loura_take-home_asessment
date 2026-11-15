@@ -34,6 +34,13 @@ WHERE id = (
 )
 RETURNING {_COLUMNS}"""
 
+# Startup recovery: the process that held these leases is gone, so they are released at once
+# instead of waiting LEASE_TIMEOUT_S. attempts is kept: the lost attempt counts, so a ticket that
+# crashes the process on its last attempt ends failed / attempts_exhausted at the next claim.
+_RELEASE_CLAIMS_SQL = (
+    "UPDATE tickets SET claimed_at = NULL, updated_at = :now WHERE status = 'pending' AND claimed_at IS NOT NULL"
+)
+
 # Every finishing write: only the worker holding the live claim may change the row.
 _GUARD = " WHERE id = :id AND status = 'pending' AND claimed_at = :token"
 # flagged is OR-ed (MAX over 0/1; :flagged is always bound as an int, since MAX(x, NULL) is NULL) and
@@ -162,6 +169,11 @@ class Repository:
             with closing(conn.execute(_CLAIM_SQL, params)) as cur:
                 row = cur.fetchone()
         return None if row is None else ticket_from_row(row)
+
+    def release_all_claims(self) -> int:
+        """Release every live claim; returns how many. Startup only: assumes no other process holds one."""
+        with self._db.connection() as conn:
+            return conn.execute(_RELEASE_CLAIMS_SQL, {"now": self._now()}).rowcount
 
     def finish_classified(self, id: str, *, token: str, result: Accepted, prompt_version: str) -> bool:
         """Store an accepted classification. False when the claim ``token`` is no longer live."""

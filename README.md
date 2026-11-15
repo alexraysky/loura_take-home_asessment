@@ -168,6 +168,7 @@ POST /tickets -> pending (attempts 0)
        claim: attempts + 1, claimed_at = now
                     v
            pending, claimed  <---- lease expired: claimable again
+                    |        <---- restart: claimed_at cleared, claimable at once
                     |
    +----------------+---------------------------+
    | accepted       | not accepted,             | not accepted on attempt MAX_ATTEMPTS,
@@ -195,14 +196,15 @@ Every finishing write is guarded by `WHERE id = ? AND status = 'pending' AND cla
 
 Each finished attempt logs one line with the worker, the ticket id, the attempt number, the outcome, the code, the prompt version, whether the body was truncated and the duration, for example `worker-0: t-1005 attempt 1/3 -> retry (summary_echoes_ticket) prompt=v1 truncated=false 0.004s`. Ticket text, prompts and model text are never logged. An unexpected exception, in an attempt or anywhere in the worker loop, is logged at ERROR as the type names and stack frames of the exception and of its chained causes, contexts and group members, with every exception message omitted (`ValueError (message omitted)`): a client or SDK error message can echo the prompt (the ticket) or the model's response, so it never reaches the log.
 
-On shutdown the worker tasks are cancelled. A ticket in flight keeps its claim and is picked up again once its lease expires; a write already running completes. Processing is therefore at-least-once: the model may be called twice for one ticket, but only one result is stored.
+On shutdown the worker tasks are cancelled. A ticket in flight keeps its claim and is picked up again once its lease expires, or at once on the next start: before the workers start, startup clears every claim on a pending ticket and logs how many it released. Attempts are not reset, so a ticket that crashes the process on its last attempt ends `failed` / `attempts_exhausted` without another model call. A write already running completes. Processing is therefore at-least-once: the model may be called twice for one ticket, but only one result is stored.
 
 Known limits:
 
 - Shutdown is cancel-and-go: in-flight model calls are abandoned, with no grace period.
 - The claim sorts the pending rows (the index covers the `status` filter, not the order), so each claim costs O(pending). Fine for thousands of rows, not millions.
 - An idle pool picks up a new ticket within `POLL_INTERVAL_S`; ingest does not wake the workers. Each idle claim is a tiny write.
-- The claim token is the claim's microsecond timestamp. It is unique per claim because a ticket can only be claimed again after its lease expires, and `LEASE_TIMEOUT_S` must exceed `LLM_TIMEOUT_S`.
+- The claim token is the claim's microsecond timestamp. It is unique per claim because a ticket can only be claimed again after its lease expires or after a restart, and `LEASE_TIMEOUT_S` must exceed `LLM_TIMEOUT_S`.
+- The startup claim reset assumes a single process: a second instance on the same database would wipe the first one's live claims at its start, so its results would be dropped as `stale` and the tickets classified again. Running two instances would need lease expiry only.
 - SQLite has one writer at a time: claims, results and ingest serialise, so throughput is bounded by statement latency, not by `WORKER_COUNT`.
 - A deterministic client bug costs `MAX_ATTEMPTS` model calls per ticket before it fails.
 - `last_error` holds only the last attempt's code; earlier attempts are in the logs. Truncation is logged, not stored.

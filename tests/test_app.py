@@ -13,7 +13,7 @@ from fastapi.testclient import TestClient
 from pydantic import BaseModel, Field
 
 from app.api import ApiError
-from app.clock import utc_now
+from app.clock import format_ts, utc_now
 from app.config import Settings
 from app.db import Database
 from app.llm import FakeLLM, Mode
@@ -361,10 +361,62 @@ def test_shutdown_with_an_in_flight_call_keeps_the_claim(worker_settings, clock)
         started = time.monotonic()
     assert time.monotonic() - started < 2.0
     stored = app.state.repository.get_ticket("t-1001")
-    # What #8's startup reset will find: a pending row still holding its claim.
+    # What the startup claim reset finds: a pending row still holding its claim.
     assert (stored.status, stored.attempts) == ("pending", 1)
     assert stored.claimed_at is not None
     assert gate.parked == 1
+
+
+def app_messages(caplog) -> list[str]:
+    return [r.getMessage() for r in caplog.records if r.name.startswith("app")]
+
+
+def test_restart_recovers_an_in_flight_ticket_without_waiting_for_the_lease(worker_settings, clock, caplog):
+    # A 60 s lease: within the deadline only the startup reset can explain the pickup.
+    settings = replace(worker_settings, lease_timeout_s=60.0)
+    gate = GateLLM()
+    with TestClient(create_app(settings, clock=clock, llm=gate)) as client:
+        client.post("/tickets", json=T1001)
+        wait_until(lambda: gate.parked == 1, "the model call")
+    clock.advance(1)  # a restart takes time; the new claim gets a new token
+    caplog.clear()
+    caplog.set_level(logging.INFO, logger="app")
+    fake = FakeLLM(failure_rate=0.0, gullible=False)
+    with TestClient(create_app(settings, clock=clock, llm=fake)) as client:
+        body = wait_for_status(client, "t-1001", "classified")
+    assert (body["attempts"], body["last_error"], body["prompt_version"]) == (2, None, "v1")
+    assert len(fake.calls) == 1
+    assert gate.parked == 1
+    messages = app_messages(caplog)
+    released = messages.index("released 1 claim(s) left by the previous run")
+    assert released < messages.index("starting 2 workers")
+
+
+def test_startup_logs_zero_released_claims_on_a_clean_database(settings, clock, caplog):
+    caplog.set_level(logging.INFO, logger="app")
+    with TestClient(create_app(settings, clock=clock)):
+        pass
+    messages = app_messages(caplog)
+    released = messages.index("released 0 claim(s) left by the previous run")
+    assert released == next(i for i, m in enumerate(messages) if m.startswith("schema ready at ")) + 1
+
+
+def test_startup_reset_runs_before_the_workers_start(worker_settings, clock, caplog):
+    settings = replace(worker_settings, lease_timeout_s=60.0)
+    db = Database(settings.db_path)
+    db.create_schema()
+    repository = Repository(db, clock)
+    repository.insert_ticket(T1001["id"], T1001["subject"], T1001["body"])
+    with db.connection() as conn:
+        conn.execute("UPDATE tickets SET attempts = 1, claimed_at = ? WHERE id = 't-1001'", (format_ts(clock()),))
+    clock.advance(1)
+    caplog.set_level(logging.INFO, logger="app")
+    app = create_app(settings, clock=clock, llm=FakeLLM(failure_rate=0.0, gullible=False))
+    with TestClient(app) as client:
+        body = wait_for_status(client, "t-1001", "classified")
+    assert (body["attempts"], body["last_error"]) == (2, None)
+    messages = app_messages(caplog)
+    assert messages.index("released 1 claim(s) left by the previous run") < messages.index("starting 2 workers")
 
 
 def test_health_still_ok_with_workers_running(worker_settings, clock):
