@@ -1,6 +1,7 @@
 import asyncio
 import json
 import random
+import re
 import shutil
 import time
 from dataclasses import replace
@@ -19,6 +20,7 @@ from app.repository import Repository
 from app.validation import FLAG_REASON_ECHO, Rejected, normalise_for_match, quoted_spans, validate_response
 from app.worker import Outcome, Processed, Worker
 from tests.sample_data import (
+    DATA_DIR,
     EXPECTED,
     EXPECTED_ROWS,
     INJECTED,
@@ -30,6 +32,9 @@ from tests.sample_data import (
 
 IDS = [f"t-{n}" for n in range(1001, 1011)]
 ATTACKER_SUMMARY = HIJACKED_ANSWER["summary"]
+README = DATA_DIR.parent / "README.md"
+# One row of the README's expected-labels table: | t-1001 | billing | medium | no | What it tests |
+README_ROW_RE = re.compile(r"^\| (t-\d{4}) \| (\w+) \| (\w+) \| (yes|no) \| (.+?) \|$", re.M)
 DEADLINE_S = 5.0
 # Attempts each sample takes under the default fake (seed 42, failure rate 0.2, gullible) through the
 # real worker loop: t-1001 draws schema_violation, t-1003 not_json and t-1005 is hijacked first. The
@@ -227,3 +232,14 @@ async def test_default_fake_never_stores_the_attack_on_any_sample(db, settings, 
 
     runs = await asyncio.gather(*(run_seed(seed) for seed in range(50)))
     assert {status for endings in runs for status in endings.values()} == {"classified", "failed"}
+
+
+# D. Documentation
+
+
+def test_readme_table_matches_expected_labels():
+    rows = README_ROW_RE.findall(README.read_text(encoding="utf-8"))
+    assert rows == [
+        (row["id"], row["category"], row["priority"], "yes" if row["flagged"] else "no", row["what_it_tests"])
+        for row in EXPECTED_ROWS
+    ]
