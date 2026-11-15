@@ -154,6 +154,32 @@ For `validation_error`, `details` lists one `{"loc", "msg", "type"}` entry per p
 
 The sample loader arrives with #10.
 
+## Model output validation
+
+The worker (#7) hands the model's raw text to `app/validation.py`, which returns either a typed classification or a rejection code.
+Rules run in order and the first failure wins:
+
+| # | Rule | Code |
+|---|---|---|
+| 1 | Raw response at most 4,096 UTF-8 bytes | `response_too_large` |
+| 2 | The whole response is one JSON object: no prose, no code fences, no `NaN` or `Infinity`, no duplicate keys | `not_json` |
+| 3 | Exactly the five keys `category`, `priority`, `summary`, `flagged`, `flag_reason`, strict types, no coercion; `flag_reason` is `null` or at most 200 characters on one line without control characters | `schema_violation` |
+| 3 | `category` and `priority` are from the allowed sets (checked only when nothing else in rule 3 failed) | `value_out_of_set` |
+| 4 | `summary`, trimmed, is 1 to 200 characters, one line, without control, format or private-use characters, and one sentence | `summary_invalid` |
+| 5 | `summary` does not contain any double-quoted span of three or more words from the ticket subject or body, compared case-insensitively with whitespace collapsed | `summary_echoes_ticket` |
+
+Wrapped JSON is rejected and retried, not extracted. `last_error` holds the code, never the model's text, and the model's text is never logged.
+The stored `summary` is trimmed of surrounding whitespace only; a `flag_reason` that is blank after trimming is stored as `null`.
+A `summary_echoes_ticket` rejection also marks the ticket `flagged` with reason `summary echoed quoted ticket text`; this flag is set by code, and later attempts keep it and its reason.
+
+Known limits:
+
+- The quote check catches a planted phrase such as the one in sample ticket t-1005. Paraphrase, a changed word, single quotes or no quotes at all evade it.
+- Text is not normalised with NFKC, so full-width or look-alike letters (Cyrillic `а` for Latin `a`) evade it too.
+- It reads the full stored subject and body, so it may match a span beyond what the prompt shows the model. That is harmless.
+- `flag_reason` is free model text and is not checked for quoted ticket text.
+- The one-sentence rule is a heuristic: "Mr. Smith asks for a refund." is rejected and retried. Emoji joined with zero-width joiners are rejected as format characters.
+
 ## Configuration
 
 Environment variables with defaults:
@@ -203,7 +229,7 @@ app/
   worker.py       Claim, classify, retry loop                   (planned)
   classifier.py   One classification attempt                    (planned)
   prompt.py       System prompt, PROMPT_VERSION, ticket wrapping (planned)
-  validation.py   Model text to typed result or typed rejection (planned)
+  validation.py   Model text to typed result or typed rejection
   llm/base.py     LLMClient protocol and error types
   llm/fake.py     Deterministic fake
   seed.py         Loads the sample tickets                      (planned)
