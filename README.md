@@ -156,9 +156,60 @@ For `validation_error`, `details` lists one `{"loc", "msg", "type"}` entry per p
 
 The sample loader arrives with #10.
 
+## Classification worker
+
+The `tickets` table is the queue. `WORKER_COUNT` asyncio tasks in the API process each loop: claim one `pending` ticket, call the model once, validate the answer, write the result. `WORKER_COUNT=0` disables them (the API tests run that way).
+
+A claim is a single `UPDATE … RETURNING` that picks the oldest claimable row (by `created_at`, then `id`), increments `attempts` and sets `claimed_at`. SQLite takes the write lock before the statement's subquery runs, so two workers never take the same row. A row is claimable when it is `pending`, has no live lease (`claimed_at` is `NULL` or older than `LEASE_TIMEOUT_S`) and has no future `next_attempt_at`. Every repository call runs in a thread, so SQLite never blocks the event loop. An idle worker sleeps `POLL_INTERVAL_S` between claims; a busy one claims again at once.
+
+```text
+POST /tickets -> pending (attempts 0)
+                    |
+       claim: attempts + 1, claimed_at = now
+                    v
+           pending, claimed  <---- lease expired: claimable again
+                    |
+   +----------------+---------------------------+
+   | accepted       | not accepted,             | not accepted on attempt MAX_ATTEMPTS,
+   |                | attempts < MAX_ATTEMPTS   | or claimed with attempts > MAX_ATTEMPTS
+   v                v                           v
+classified       pending, last_error = code,  failed, last_error = code
+labels,          next_attempt_at = now + backoff
+prompt_version
+```
+
+Each attempt builds a fresh prompt, calls the model under `LLM_TIMEOUT_S` and hands the raw text to output validation. An accepted answer makes the ticket `classified` with its labels and `prompt_version`, and clears `last_error`. Anything else releases the claim with `last_error` set and `next_attempt_at = now + BACKOFF_BASE_S · 2^(attempts−1) + jitter` (jitter is up to one more `BACKOFF_BASE_S`), so with the defaults a ticket is retried after 1–2 s and then 2–3 s. Timeouts, unavailability, invalid output and unexpected errors follow the same policy, and `attempts` alone decides when a ticket is terminal: the last of `MAX_ATTEMPTS` attempts that is not accepted makes it `failed` with that attempt's code. Attempts are counted at claim time, so a ticket whose worker dies cannot loop forever: one claimed with more attempts than allowed is marked `failed` with `attempts_exhausted` without another model call.
+
+`last_error` holds one of these codes, never the model's text:
+
+| Code | When |
+|---|---|
+| `llm_timeout` | The client gave up, or the call ran past `LLM_TIMEOUT_S` and was cancelled |
+| `llm_unavailable` | The model could not be reached or refused the request |
+| `llm_error` | Any other client error |
+| `response_too_large`, `not_json`, `schema_violation`, `value_out_of_set`, `summary_invalid`, `summary_echoes_ticket` | Output validation rejected the answer (see below) |
+| `unexpected_error` | Any other exception during the attempt (a client bug, non-text output); logged with a traceback |
+| `attempts_exhausted` | The ticket was claimed with no attempts left (terminal, no model call) |
+
+Every finishing write is guarded by `WHERE id = ? AND status = 'pending' AND claimed_at = <the claim's timestamp>`, so a worker whose lease expired cannot overwrite the result of the worker that took over; its write matches no row and is logged as `stale`. `flagged` only ever goes up and the first `flag_reason` written is kept, on every outcome: the quote check's flag from a rejected attempt survives a later honest answer or a `failed` ending. Sample ticket t-1005 therefore ends `billing`/`low` with `flagged` true and reason `summary echoed quoted ticket text`, even though the accepted answer carried a reason of its own.
+
+Each finished attempt logs one line with the worker, the ticket id, the attempt number, the outcome, the code, the prompt version, whether the body was truncated and the duration, for example `worker-0: t-1005 attempt 1/3 -> retry (summary_echoes_ticket) prompt=v1 truncated=false 0.004s`. Ticket text, prompts and model text are never logged.
+
+On shutdown the worker tasks are cancelled. A ticket in flight keeps its claim and is picked up again once its lease expires; a write already running completes. Processing is therefore at-least-once: the model may be called twice for one ticket, but only one result is stored.
+
+Known limits:
+
+- Shutdown is cancel-and-go: in-flight model calls are abandoned, with no grace period.
+- The claim sorts the pending rows (the index covers the `status` filter, not the order), so each claim costs O(pending). Fine for thousands of rows, not millions.
+- An idle pool picks up a new ticket within `POLL_INTERVAL_S`; ingest does not wake the workers. Each idle claim is a tiny write.
+- The claim token is the claim's microsecond timestamp. It is unique per claim because a ticket can only be claimed again after its lease expires, and `LEASE_TIMEOUT_S` must exceed `LLM_TIMEOUT_S`.
+- SQLite has one writer at a time: claims, results and ingest serialise, so throughput is bounded by statement latency, not by `WORKER_COUNT`.
+- A deterministic client bug costs `MAX_ATTEMPTS` model calls per ticket before it fails.
+- `last_error` holds only the last attempt's code; earlier attempts are in the logs. Truncation is logged, not stored.
+
 ## Model output validation
 
-The worker (#7) hands the model's raw text to `app/validation.py`, which returns either a typed classification or a rejection code.
+The worker hands the model's raw text to `app/validation.py`, which returns either a typed classification or a rejection code.
 Rules run in order and the first failure wins:
 
 | # | Rule | Code |
@@ -250,6 +301,8 @@ FAKE_LLM_FAILURE_RATE=0.2
 FAKE_LLM_GULLIBLE=true    the fake obeys injected instructions on the first attempt
 ```
 
+`LEASE_TIMEOUT_S` must also cover the time an attempt can wait for the database lock on its claim and its result write (`BUSY_TIMEOUT_S`, 5 s each, in `app/db.py`): keep `LEASE_TIMEOUT_S >= LLM_TIMEOUT_S + 2 * BUSY_TIMEOUT_S`, which the defaults satisfy (60 >= 20). This is recommended, not checked at startup.
+
 Unset or blank variables use the default; surrounding whitespace is ignored. Booleans accept `1/0`, `true/false`, `yes/no` and `on/off`, case-insensitive. Numbers are plain ASCII; integers are digits with an optional sign.
 
 The app refuses to start, naming the variable, when a value is malformed, not finite or out of bounds:
@@ -279,8 +332,8 @@ app/
   models.py       Shared domain types: allowed values and the Ticket row
   db.py           Connection factory and schema creation
   repository.py   All SQL lives here
-  worker.py       Claim, classify, retry loop                   (planned)
-  classifier.py   One classification attempt                    (planned)
+  worker.py       Claim, classify, retry loop
+  classifier.py   One classification attempt
   prompt.py       System prompt, PROMPT_VERSION, ticket wrapping
   validation.py   Model text to typed result or typed rejection
   llm/base.py     LLMClient protocol and error types
