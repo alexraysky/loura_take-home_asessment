@@ -15,7 +15,10 @@ from app.api import ApiError, ErrorBody, ErrorEnvelope, router
 from app.clock import Clock, utc_now
 from app.config import Settings
 from app.db import Database
+from app.llm.base import LLMClient
+from app.llm.fake import FakeLLM
 from app.repository import Repository
+from app.worker import WorkerPool
 
 log = logging.getLogger("app")
 
@@ -24,12 +27,24 @@ _HTTP_CODES = {404: "not_found", 405: "method_not_allowed"}
 _NO_BODY = {204, 304}
 
 
-def create_app(settings: Settings | None = None, *, clock: Clock = utc_now) -> FastAPI:
-    """Build the app. Settings default to the environment, so bad config fails at startup."""
+def create_app(
+    settings: Settings | None = None,
+    *,
+    clock: Clock = utc_now,
+    llm: LLMClient | None = None,
+) -> FastAPI:
+    """Build the app. Settings default to the environment, so bad config fails at startup.
+
+    ``llm`` defaults to the fake configured by the settings; tests inject scripted clients.
+    """
     settings = Settings.from_env() if settings is None else settings
+    if llm is not None and not isinstance(llm, LLMClient):
+        raise TypeError("llm must implement LLMClient")
     _configure_logging()
     db = Database(settings.db_path)
     repository = Repository(db, clock)
+    llm = FakeLLM.from_settings(settings) if llm is None else llm
+    workers = WorkerPool(repository, llm, settings)
 
     @asynccontextmanager
     async def lifespan(app: FastAPI) -> AsyncIterator[None]:
@@ -37,15 +52,19 @@ def create_app(settings: Settings | None = None, *, clock: Clock = utc_now) -> F
         db.create_schema()
         log.info("schema ready at %s", db.path)
         # #8: clear stale claims before workers start
-        # #7: start settings.worker_count worker tasks when worker_count > 0
-        yield
-        # #7: cancel worker tasks
+        await workers.start()
+        try:
+            yield
+        finally:
+            await workers.stop()
 
     app = FastAPI(title="Ticket classifier", lifespan=lifespan)
     app.state.settings = settings
     app.state.clock = clock
     app.state.db = db
     app.state.repository = repository
+    app.state.llm = llm
+    app.state.workers = workers
     install_error_handlers(app)
     app.include_router(router)
     return app
