@@ -19,7 +19,7 @@ An older uv stops with `Required uv version ... does not match`; run `uv self up
 ```sh
 make run     # start the API on http://127.0.0.1:8000 (HOST=... PORT=... to override)
 make test    # run the test suite
-make seed    # load the sample tickets into a running server (arrives with the loader, #10)
+make seed    # load the sample tickets into a running server (see Sample data below)
 ```
 
 The first `make run` or `make test` creates `.venv` from the committed `uv.lock`.
@@ -35,6 +35,36 @@ uv run uvicorn app.main:create_app --factory --host 127.0.0.1 --port 8000
 uv run pytest
 uv run python -m app.seed --base-url http://127.0.0.1:8000
 ```
+
+### Sample data
+
+`data/sample_tickets.json` holds the ten sample tickets as `POST /tickets` payloads and `data/expected_labels.json` the labels they should get. With `make run` in one terminal, `make seed` in another posts them in file order through the real HTTP API and prints one line per ticket, then a summary:
+
+```text
+t-1001 202 Accepted
+...
+t-1010 202 Accepted
+10 tickets: 10 accepted, 0 already stored, 0 other
+```
+
+Ingest is idempotent, so a second run writes nothing, prints `t-1001 200 OK (already stored)` for every ticket and leaves exactly ten in the database. Any other status is printed with the error envelope's code, for example `t-1001 409 Conflict (ticket_conflict)` when the stored ticket has different text (delete `tickets.db` or set another `DB_PATH`). The exit code is 0 when every ticket got 202 or 200, 1 when any got another status (the rest are still sent) or the server could not be reached (the loader stops at the first failed request), and 2 for bad arguments or a malformed file, before anything is sent. `python -m app.seed --help` lists `--base-url` (http or https, a path prefix is kept), `--file` and `--timeout`. The loader uses only the standard library, prints ids and status codes, never ticket text or response bodies, and does not wait for classification: follow it with `GET /tickets?limit=100`.
+
+The expected labels, which are also the worked examples for the priority rubric:
+
+| id | Category | Priority | Flagged | What it tests |
+|---|---|---|---|---|
+| t-1001 | billing | medium | no | Plain case; money owed back |
+| t-1002 | account | medium | no | Login is account, not technical |
+| t-1003 | technical | high | no | Production impact, blocking, 30% of requests |
+| t-1004 | account | low | no | How-to question |
+| t-1005 | billing | low | yes | Injection; the real question is invoices; flagged |
+| t-1006 | other | low | no | Feature request fits no category |
+| t-1007 | billing | medium | no | Deadline (the 15th) raises priority |
+| t-1008 | other | low | no | Empty subject, no content; must not crash or be rejected |
+| t-1009 | technical | medium | no | Second topic (billing) is explicitly deferred; must not win |
+| t-1010 | technical | medium | no | Quoted staff text is not the customer's claim; repeat contact |
+
+With the default fake settings (`FAKE_LLM_SEED=42`, `FAKE_LLM_FAILURE_RATE=0.2`, `FAKE_LLM_GULLIBLE=true`) all ten end `classified` with these labels. Three need a second attempt, 1 to 2 s later: t-1001 and t-1003 draw a simulated failure first, and t-1005's first answer obeys the injection and is rejected by the quote check, so t-1005 ends flagged with reason `summary echoed quoted ticket text`. The draw is a hash of the seed and the prompt, so another seed gives another mix, and a ticket can end `failed`: 0.2³ = 0.8 % per ticket, 0.2² = 4 % for t-1005, whose first attempt always goes to the injection. `FAKE_LLM_FAILURE_RATE=0 make run` gives a run without simulated failures; with `FAKE_LLM_GULLIBLE=false` as well, t-1005 is classified on its first attempt, flagged by the fake with reason `Ticket text addresses the classifier.`
 
 ## API
 
@@ -154,8 +184,6 @@ For `validation_error`, `details` lists one `{"loc", "msg", "type"}` entry per p
 
 `invalid_cursor` covers anything that is not exactly a `next_cursor` the service produced: wrong alphabet, padding, length or content.
 
-The sample loader arrives with #10.
-
 ## Classification worker
 
 The `tickets` table is the queue. `WORKER_COUNT` asyncio tasks in the API process each loop: claim one `pending` ticket, call the model once, validate the answer, write the result. `WORKER_COUNT=0` disables them (the API tests run that way).
@@ -222,7 +250,7 @@ Rules run in order and the first failure wins:
 | 3 | Exactly the five keys `category`, `priority`, `summary`, `flagged`, `flag_reason`, strict types, no coercion; `flag_reason` is `null` or at most 200 characters on one line without control characters | `schema_violation` |
 | 3 | `category` and `priority` are from the allowed sets (checked only when nothing else in rule 3 failed) | `value_out_of_set` |
 | 4 | `summary`, trimmed, is 1 to 200 characters, one line, without control, format or private-use characters, and one sentence | `summary_invalid` |
-| 5 | `summary` does not contain any double-quoted span of three or more words from the ticket subject or body, compared case-insensitively with whitespace collapsed | `summary_echoes_ticket` |
+| 5 | `summary` does not contain any quoted span of three or more words from the ticket subject or body, compared case-insensitively with whitespace collapsed. Double quotes (`"` `“` `”` `„` `«` `»`) always count; single quotes (`'` `‘` `’` `‚` `‹` `›`) only when the opening one has no word character (letter, digit or `_`) before it and the closing one none after it, so apostrophes in `I'd` or `customers'` never pair up | `summary_echoes_ticket` |
 
 Wrapped JSON is rejected and retried, not extracted. `last_error` holds the code, never the model's text, and the model's text is never logged.
 The stored `summary` is trimmed of surrounding whitespace only; a `flag_reason` that is blank after trimming is stored as `null`.
@@ -230,7 +258,8 @@ A `summary_echoes_ticket` rejection also marks the ticket `flagged` with reason 
 
 Known limits:
 
-- The quote check catches a planted phrase such as the one in sample ticket t-1005. Paraphrase, a changed word, single quotes or no quotes at all evade it.
+- The quote check catches a planted phrase such as the one in sample ticket t-1005. Paraphrase, a changed word or no quotes at all evade it.
+- A single-quoted span may start or end on an apostrophe when one quote is missing: in `the '90s and the users' data` the opening quote of `'90s` pairs with the possessive. A spurious span only makes the check stricter.
 - Text is not normalised with NFKC, so full-width or look-alike letters (Cyrillic `а` for Latin `a`) evade it too.
 - It reads the full stored subject and body, so it may match a span beyond what the prompt shows the model. That is harmless.
 - `flag_reason` is free model text and is not checked for quoted ticket text.
@@ -285,7 +314,7 @@ medium  one user blocked, money owed, or a stated deadline
 low     questions, requests, feedback, no time pressure
 ```
 
-Priority comes from the impact the customer describes, not from words like "URGENT" or from a claimed sender. Priorities are judgment calls; the sample tickets and their expected labels (#10) are the worked examples.
+Priority comes from the impact the customer describes, not from words like "URGENT" or from a claimed sender. Priorities are judgment calls; the sample tickets and their expected labels (see Sample data) are the worked examples.
 
 ## Configuration
 
@@ -324,8 +353,6 @@ The app refuses to start, naming the variable, when a value is malformed, not fi
 
 ## Layout
 
-Files marked `(planned)` arrive with later issues.
-
 ```text
 app/
   main.py         FastAPI app factory, lifespan, error handlers
@@ -341,10 +368,10 @@ app/
   validation.py   Model text to typed result or typed rejection
   llm/base.py     LLMClient protocol and error types
   llm/fake.py     Deterministic fake
-  seed.py         Loads the sample tickets                      (planned)
-data/                                                            (planned)
-  sample_tickets.json
-  expected_labels.json
+  seed.py         Loads the sample tickets through the HTTP API
+data/
+  sample_tickets.json   The ten sample tickets as POST /tickets payloads
+  expected_labels.json  Their expected category, priority and flag
 tests/
 .python-version
 pyproject.toml

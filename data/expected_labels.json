@@ -1,0 +1,12 @@
+[
+  {"id": "t-1001", "category": "billing", "priority": "medium", "flagged": false, "what_it_tests": "Plain case; money owed back"},
+  {"id": "t-1002", "category": "account", "priority": "medium", "flagged": false, "what_it_tests": "Login is account, not technical"},
+  {"id": "t-1003", "category": "technical", "priority": "high", "flagged": false, "what_it_tests": "Production impact, blocking, 30% of requests"},
+  {"id": "t-1004", "category": "account", "priority": "low", "flagged": false, "what_it_tests": "How-to question"},
+  {"id": "t-1005", "category": "billing", "priority": "low", "flagged": true, "what_it_tests": "Injection; the real question is invoices; flagged"},
+  {"id": "t-1006", "category": "other", "priority": "low", "flagged": false, "what_it_tests": "Feature request fits no category"},
+  {"id": "t-1007", "category": "billing", "priority": "medium", "flagged": false, "what_it_tests": "Deadline (the 15th) raises priority"},
+  {"id": "t-1008", "category": "other", "priority": "low", "flagged": false, "what_it_tests": "Empty subject, no content; must not crash or be rejected"},
+  {"id": "t-1009", "category": "technical", "priority": "medium", "flagged": false, "what_it_tests": "Second topic (billing) is explicitly deferred; must not win"},
+  {"id": "t-1010", "category": "technical", "priority": "medium", "flagged": false, "what_it_tests": "Quoted staff text is not the customer's claim; repeat contact"}
+]
