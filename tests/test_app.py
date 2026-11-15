@@ -1,4 +1,3 @@
-import asyncio
 import logging
 import os
 import sqlite3
@@ -21,6 +20,7 @@ from app.main import create_app
 from app.repository import Repository
 from app.worker import WorkerPool
 from tests.sample_data import TICKET_PAYLOADS
+from tests.workers import GateLLM, wait_for_status, wait_until
 
 
 class Item(BaseModel):
@@ -254,44 +254,6 @@ def test_in_memory_db_path_fails_at_create_app(db_path):
 # Model client and workers.
 
 T1001 = TICKET_PAYLOADS[0]
-DEADLINE_S = 5.0
-
-
-class GateLLM:
-    """Parks every call forever; counts the parked calls."""
-
-    def __init__(self) -> None:
-        self.parked = 0
-
-    async def complete(self, system: str, user: str) -> str:
-        self.parked += 1
-        await asyncio.Event().wait()
-        raise AssertionError("unreachable")
-
-
-@pytest.fixture
-def worker_settings(settings: Settings) -> Settings:
-    # backoff 0: a retry is claimable at once, so the frozen FakeClock never needs to move.
-    return replace(
-        settings, worker_count=2, poll_interval_s=0.001, backoff_base_s=0.0, llm_timeout_s=1.0, lease_timeout_s=2.0
-    )
-
-
-def wait_until(predicate, what: str):
-    deadline = time.monotonic() + DEADLINE_S
-    while time.monotonic() < deadline:
-        if result := predicate():
-            return result
-        time.sleep(0.005)
-    raise AssertionError(f"timed out waiting for {what}")
-
-
-def wait_for_status(client: TestClient, id: str, status: str) -> dict:
-    def check():
-        body = client.get(f"/tickets/{id}").json()
-        return body if body["status"] == status else None
-
-    return wait_until(check, f"{id} to be {status}")
 
 
 def test_default_llm_is_the_fake_from_settings(settings, clock):

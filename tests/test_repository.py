@@ -6,8 +6,8 @@ from datetime import timedelta
 import pytest
 
 from app.clock import format_ts
-from app.models import Ticket
-from app.repository import _COLUMNS, Repository
+from app.models import SELECTORS, Ticket
+from app.repository import _COLUMNS, Repository, _requeue_query
 from app.validation import FLAG_REASON_ECHO, Accepted
 
 
@@ -547,3 +547,238 @@ def test_finish_with_a_pre_reset_token_is_ignored(repository, clock, finish):
     second = claim(repository)
     assert finish(repository, first.claimed_at) is False
     assert repository.get_ticket("t-1") == second
+
+
+# Operator requeue (#11).
+
+LABELS = {"status": "classified", "category": "other", "priority": "low", "summary": "x"}
+FAILED_IDS = {"failed", "failed-claimed"}
+OUTDATED_IDS = {"outdated", "outdated-null"}
+PENDING_IDS = {"pending-new", "pending-claimed", "pending-backoff"}
+
+
+def plant_requeue_rows(repository, db, clock) -> dict[str, Ticket]:
+    """One row per case the requeue filter must tell apart; returns the rows as stored."""
+    repository.insert_ticket("pending-claimed", "", "x")
+    assert claim(repository).id == "pending-claimed"  # in flight: a live claim
+    for id in ("failed", "failed-claimed", "outdated", "outdated-null", "current", "pending-new", "pending-backoff"):
+        repository.insert_ticket(id, "", "x")
+    set_columns(db, "failed", status="failed", attempts=3, last_error="not_json", flagged=1, flag_reason=FLAG_REASON_ECHO)
+    # Finish writes always clear the claim; this terminal row is planted to prove the reset clears it.
+    set_columns(db, "failed-claimed", status="failed", attempts=3, last_error="llm_timeout", claimed_at=format_ts(clock()))
+    set_columns(db, "outdated", **LABELS, attempts=2, prompt_version="v0", flagged=1, flag_reason="Model reason.")
+    set_columns(db, "outdated-null", **LABELS, attempts=1)  # prompt_version stays NULL
+    set_columns(db, "current", **LABELS, attempts=1, prompt_version="v1")
+    later = format_ts(clock() + timedelta(seconds=30))
+    set_columns(db, "pending-backoff", attempts=1, last_error="llm_timeout", next_attempt_at=later)
+    return {id: repository.get_ticket(id) for id in (*FAILED_IDS, *OUTDATED_IDS, "current", *PENDING_IDS)}
+
+
+def requeued(ticket: Ticket, now: str) -> Ticket:
+    """What a requeue makes of a row: a freshly ingested ticket, except for created_at."""
+    return replace(
+        ticket,
+        status="pending",
+        attempts=0,
+        category=None,
+        priority=None,
+        summary=None,
+        flagged=False,
+        flag_reason=None,
+        last_error=None,
+        next_attempt_at=None,
+        claimed_at=None,
+        prompt_version=None,
+        updated_at=now,
+    )
+
+
+def assert_requeued_exactly(repository, before: dict[str, Ticket], ids: set[str], now: str) -> None:
+    for id, ticket in before.items():
+        expected = requeued(ticket, now) if id in ids else ticket
+        assert repository.get_ticket(id) == expected, id
+
+
+@pytest.mark.parametrize(
+    ("selectors", "ids"),
+    [
+        pytest.param(["failed"], FAILED_IDS, id="D1-failed"),
+        pytest.param(["outdated_prompt"], OUTDATED_IDS, id="D1-outdated_prompt"),
+        pytest.param(["failed", "outdated_prompt"], FAILED_IDS | OUTDATED_IDS, id="D2-both"),
+        pytest.param(["outdated_prompt", "failed"], FAILED_IDS | OUTDATED_IDS, id="D2-both-reversed"),
+        pytest.param(frozenset(SELECTORS), FAILED_IDS | OUTDATED_IDS, id="D2-frozenset"),
+    ],
+)
+def test_requeue_resets_exactly_the_selected_rows(repository, db, clock, selectors, ids):
+    before = plant_requeue_rows(repository, db, clock)
+    clock.advance(5)
+    assert repository.requeue(selectors, current_prompt_version="v1") == len(ids)
+    assert_requeued_exactly(repository, before, ids, format_ts(clock()))
+
+
+def test_requeue_leaves_current_version_classified_untouched(repository, db, clock):
+    before = plant_requeue_rows(repository, db, clock)
+    assert before["current"].prompt_version == "v1"
+    clock.advance(5)
+    repository.requeue(SELECTORS, current_prompt_version="v1")
+    assert repository.get_ticket("current") == before["current"]
+
+
+def test_requeue_with_a_newer_current_version_takes_v1_rows(repository, db, clock):
+    # The comparison is against the argument, not against a constant the repository knows.
+    before = plant_requeue_rows(repository, db, clock)
+    clock.advance(5)
+    assert repository.requeue(["outdated_prompt"], current_prompt_version="v2") == 3
+    assert_requeued_exactly(repository, before, OUTDATED_IDS | {"current"}, format_ts(clock()))
+
+
+def test_requeue_leaves_pending_rows_untouched(repository, db, clock):
+    before = plant_requeue_rows(repository, db, clock)
+    assert before["pending-claimed"].claimed_at is not None
+    assert before["pending-backoff"].next_attempt_at is not None
+    clock.advance(5)
+    repository.requeue(SELECTORS, current_prompt_version="v1")
+    for id in PENDING_IDS:
+        assert repository.get_ticket(id) == before[id], id
+
+
+def test_requeue_on_an_empty_table_returns_zero(repository):
+    assert repository.requeue(SELECTORS, current_prompt_version="v1") == 0
+
+
+def test_requeue_twice_returns_zero_the_second_time(repository, db, clock):
+    plant_requeue_rows(repository, db, clock)
+    assert repository.requeue(SELECTORS, current_prompt_version="v1") == 4
+    after_first = {id: repository.get_ticket(id) for id in FAILED_IDS | OUTDATED_IDS}
+    clock.advance(5)
+    assert repository.requeue(SELECTORS, current_prompt_version="v1") == 0
+    assert {id: repository.get_ticket(id) for id in after_first} == after_first
+
+
+@pytest.mark.parametrize("selectors", [[], (), frozenset(), ["bogus"], ["failed", "bogus"], ["FAILED"]])
+def test_requeue_rejects_no_or_unknown_selectors(repository, db, clock, selectors):
+    before = plant_requeue_rows(repository, db, clock)
+    with pytest.raises(ValueError, match="selector"):
+        repository.requeue(selectors, current_prompt_version="v1")
+    assert {id: repository.get_ticket(id) for id in before} == before
+
+
+@pytest.mark.parametrize("version", ["", None, 1])
+def test_requeue_rejects_an_empty_or_non_str_current_version(repository, db, clock, version):
+    before = plant_requeue_rows(repository, db, clock)
+    with pytest.raises(ValueError, match="current_prompt_version"):
+        repository.requeue(SELECTORS, current_prompt_version=version)
+    assert {id: repository.get_ticket(id) for id in before} == before
+
+
+def test_requeued_row_is_claimable_at_once_with_attempts_one(repository, db, clock):
+    repository.insert_ticket("t-1", "", "x")
+    set_columns(db, "t-1", status="failed", attempts=3, last_error="not_json")
+    assert claim(repository) is None
+    clock.advance(1)
+    assert repository.requeue(["failed"], current_prompt_version="v1") == 1
+    clock.advance(1)
+    ticket = claim(repository)
+    assert (ticket.id, ticket.attempts, ticket.claimed_at) == ("t-1", 1, format_ts(clock()))
+    assert repository.finish_classified("t-1", token=ticket.claimed_at, result=ACCEPTED, prompt_version="v2")
+    stored = repository.get_ticket("t-1")
+    assert (stored.status, stored.attempts, stored.prompt_version, stored.last_error) == ("classified", 1, "v2", None)
+
+
+@pytest.mark.parametrize("finish", FINISHES.values(), ids=FINISHES.keys())
+def test_stale_finish_after_requeue_is_ignored(repository, clock, finish):
+    repository.insert_ticket("t-1", "", "x")
+    first = claim(repository)
+    assert repository.finish_classified("t-1", token=first.claimed_at, result=ACCEPTED, prompt_version="v0")
+    assert repository.requeue(["outdated_prompt"], current_prompt_version="v1") == 1
+    reset = repository.get_ticket("t-1")
+    clock.advance(1)  # the clock moves between a finish and a later claim, so tokens never repeat
+    assert finish(repository, first.claimed_at) is False
+    assert repository.get_ticket("t-1") == reset
+    second = claim(repository)
+    assert second.claimed_at != first.claimed_at
+    assert finish(repository, first.claimed_at) is False
+    assert repository.get_ticket("t-1") == second
+    assert repository.finish_classified("t-1", token=second.claimed_at, result=ACCEPTED, prompt_version="v1")
+    stored = repository.get_ticket("t-1")
+    assert (stored.status, stored.attempts, stored.prompt_version) == ("classified", 1, "v1")
+
+
+@pytest.mark.parametrize("run", range(3))
+def test_requeue_and_concurrent_claims_never_double_claim(repository, db, clock, run):
+    outdated = [f"t-old-{i:02d}" for i in range(8)]
+    fresh = [f"t-new-{i:02d}" for i in range(8)]
+    for id in outdated:
+        repository.insert_ticket(id, "", "x")
+        set_columns(db, id, **LABELS, attempts=1, prompt_version="v0")
+    for id in fresh:
+        repository.insert_ticket(id, "", "x")
+    clock.advance(1)
+    claimers = 16
+    barrier = threading.Barrier(claimers + 1, timeout=10)
+    claimed: list[Ticket | None] = []
+    counts: list[int] = []
+    errors: list[BaseException] = []
+    lock = threading.Lock()
+
+    def record(action, results: list) -> None:
+        try:
+            barrier.wait()
+            result = action()
+            with lock:
+                results.append(result)
+        except BaseException as exc:
+            with lock:
+                errors.append(exc)
+
+    def requeue() -> int:
+        return repository.requeue(SELECTORS, current_prompt_version="v1")
+
+    threads = [threading.Thread(target=record, args=(lambda: claim(repository), claimed)) for _ in range(claimers)]
+    # Vary where the requeue thread starts among the claimers.
+    threads.insert(run * claimers // 2, threading.Thread(target=record, args=(requeue, counts)))
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=30)
+        assert not thread.is_alive()
+
+    assert errors == []
+    assert counts == [len(outdated)]
+    assert len(claimed) == claimers
+    taken = {t.id: t for t in claimed if t is not None}
+    assert len(taken) == sum(t is not None for t in claimed)  # no row claimed twice
+    assert all(t.attempts == 1 for t in taken.values())
+    for id in outdated + fresh:
+        stored = repository.get_ticket(id)
+        assert (stored.status, stored.category, stored.prompt_version) == ("pending", None, None), id
+        assert stored.attempts == (1 if id in taken else 0), id
+
+
+def test_requeue_query_is_one_deterministic_statement():
+    both = _requeue_query(["failed", "outdated_prompt"])
+    assert both == _requeue_query(["outdated_prompt", "failed"]) == _requeue_query(frozenset(SELECTORS))
+    assert both.startswith("UPDATE tickets SET status = 'pending', ")
+    assert both.count("UPDATE") == 1 and ";" not in both
+    assert both.endswith(" WHERE status = 'failed' OR (status = 'classified' AND prompt_version IS NOT :current)")
+    assert _requeue_query(["failed"]).endswith(" WHERE status = 'failed'")
+    assert _requeue_query(["outdated_prompt"]).endswith(
+        " WHERE (status = 'classified' AND prompt_version IS NOT :current)"
+    )
+
+
+@pytest.mark.parametrize("selectors", [["failed"], ["outdated_prompt"], list(SELECTORS)])
+def test_requeue_query_uses_the_status_index(db, selectors):
+    with db.connection() as conn:
+        plan = conn.execute(f"EXPLAIN QUERY PLAN {_requeue_query(selectors)}", {"now": "x", "current": "v1"})
+        details = " | ".join(row["detail"] for row in plan.fetchall())
+    assert "idx_tickets_claim (status=?)" in details, details
+    assert "SCAN tickets" not in details, details
+
+
+def test_requeue_binds_the_version_even_for_failed_only(repository, db):
+    # sqlite3 ignores a named parameter the statement does not use: no warning, no ProgrammingError.
+    repository.insert_ticket("t-1", "", "x")
+    set_columns(db, "t-1", status="failed", last_error="not_json")
+    assert ":current" not in _requeue_query(["failed"])
+    assert repository.requeue(["failed"], current_prompt_version="v1") == 1

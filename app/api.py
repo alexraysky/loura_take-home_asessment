@@ -2,22 +2,26 @@
 
 Holds the shared error contract, the ticket schemas used by every ticket
 endpoint, ``POST /tickets``, the read endpoints (``GET /tickets/{id}``,
-``GET /tickets`` with its cursor codec) and the operational health probe.
+``GET /tickets`` with its cursor codec), ``POST /tickets/reclassify`` and the
+operational health probe.
 """
 
 import asyncio
 import base64
+import logging
 import re
 from typing import Annotated, Any, Literal
 
 from fastapi import APIRouter, Depends, Query, Request, Response
 from fastapi.exceptions import RequestValidationError
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import AfterValidator, BaseModel, ConfigDict, Field
 
 from app.clock import parse_ts
-from app.models import Category, Priority, Status
+from app.models import SELECTORS, Category, Priority, Selector, Status
+from app.prompt import PROMPT_VERSION
 from app.repository import Repository
 
+log = logging.getLogger("app.api")
 router = APIRouter()
 
 
@@ -97,6 +101,31 @@ class TicketPage(BaseModel):
     next_cursor: str | None
 
 
+def _no_repeats(selectors: list[Selector]) -> list[Selector]:
+    if len(set(selectors)) != len(selectors):
+        raise ValueError("selectors must not repeat")
+    return selectors
+
+
+class ReclassifyRequest(BaseModel):
+    """Body of ``POST /tickets/reclassify``: which terminal tickets to put back in the queue."""
+
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    select: Annotated[list[Selector], AfterValidator(_no_repeats)] = Field(
+        min_length=1,
+        max_length=len(SELECTORS),
+        description="`failed`: tickets with status failed. `outdated_prompt`: classified tickets whose "
+        "prompt_version is not the current one. At least one, none repeated.",
+    )
+
+
+class ReclassifyResponse(BaseModel):
+    """Body of ``POST /tickets/reclassify``: how many tickets were reset to pending."""
+
+    requeued: int = Field(ge=0)
+
+
 def _error_doc(description: str) -> dict[str, Any]:
     return {"model": ErrorEnvelope, "description": description}
 
@@ -110,6 +139,7 @@ LIST_TICKETS_RESPONSES: dict[int | str, dict[str, Any]] = {
     400: _error_doc("Cursor does not decode"),
     422: _error_doc("Request validation failed"),
 }
+RECLASSIFY_RESPONSES: dict[int | str, dict[str, Any]] = {422: _error_doc("Request validation failed")}
 
 LIMIT_DEFAULT = 20
 LIMIT_MAX = 100
@@ -235,3 +265,20 @@ async def list_tickets(
     page = rows[:limit]
     next_cursor = encode_cursor(page[-1].created_at, page[-1].id) if len(rows) > limit else None
     return TicketPage(items=[TicketOut.model_validate(t) for t in page], next_cursor=next_cursor)
+
+
+@router.post(
+    "/tickets/reclassify",
+    status_code=202,
+    response_model=ReclassifyResponse,
+    responses=RECLASSIFY_RESPONSES,
+    dependencies=[Depends(reject_query_params)],
+)
+async def reclassify_tickets(
+    payload: ReclassifyRequest,
+    repository: Annotated[Repository, Depends(get_repository)],
+) -> ReclassifyResponse:
+    """Put failed and/or outdated classified tickets back in the queue; the workers pick them up."""
+    requeued = await asyncio.to_thread(repository.requeue, payload.select, current_prompt_version=PROMPT_VERSION)
+    log.info("reclassify: requeued %d (select=%s)", requeued, ",".join(payload.select))
+    return ReclassifyResponse(requeued=requeued)

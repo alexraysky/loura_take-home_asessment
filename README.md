@@ -136,6 +136,29 @@ Tickets are ordered by `created_at` ascending, then `id`, so new tickets land at
 
 The cursor is the position of the last item returned (`created_at` and `id`), not a reference to a ticket: it is accepted after the filters or `limit` change, or if no ticket has that position. A sequence of pages is not a snapshot; a ticket whose labels change while you page can appear on a later page or drop out of a filter.
 
+### `POST /tickets/reclassify`
+
+```sh
+curl -i -X POST http://127.0.0.1:8000/tickets/reclassify \
+  -H 'content-type: application/json' \
+  -d '{"select": ["failed", "outdated_prompt"]}'
+```
+
+Puts finished tickets back in the queue, for example after a prompt change or once the model is reachable again. `select` is a required list of one or both selectors, none repeated:
+
+| Selector | Selects |
+|---|---|
+| `failed` | Tickets with status `failed` |
+| `outdated_prompt` | `classified` tickets whose `prompt_version` is not the current one (`v1` today), including a classified ticket with no `prompt_version` |
+
+The response is always `202 Accepted` with the number of tickets reset, `{"requeued": 3}`, and `{"requeued": 0}` when nothing matched, for example when the same call is repeated.
+
+The selected tickets are reset in one statement: `status` becomes `pending`, `attempts` 0, and `category`, `priority`, `summary`, `last_error` and `prompt_version` become `null`, `flagged` false and `flag_reason` `null`; `updated_at` is the time of the call. A requeued ticket therefore reads like a freshly ingested one apart from `created_at` and `updated_at`. Only `classified` and `failed` tickets are touched: a `pending` ticket, in flight or waiting for a retry, is never reset under a worker. The workers then classify the requeued tickets like new ones, with a fresh `MAX_ATTEMPTS`, and store the current `prompt_version`, so `outdated_prompt` selects nothing once they are done.
+
+An empty, repeated or unknown selector, a missing `select`, an unknown field, any query parameter or a body not sent as JSON is `422`, code `validation_error`; a body that cannot be decoded is `400`, code `http_error`. A rejected request changes nothing.
+
+The path does not stop a ticket from having the id `reclassify`: `POST /tickets/reclassify` is always this action, and `GET /tickets/reclassify` returns that ticket.
+
 ### Ticket representation
 
 ```json
@@ -159,7 +182,7 @@ The cursor is the position of the last item returned (`created_at` and `id`), no
 
 `claimed_at` and `next_attempt_at` are internal queue columns and are never returned.
 
-`summary` and `flag_reason` are model-generated text. They describe the ticket; they never approve, decide or promise anything, and a consumer must not act on them without a person reading the ticket. `prompt_version` names the prompt that produced the labels (`v1` today) and is `null` until the ticket is classified.
+`summary` and `flag_reason` are model-generated text. They describe the ticket; they never approve, decide or promise anything, and a consumer must not act on them without a person reading the ticket. `prompt_version` names the prompt that produced the labels (`v1` today) and is `null` until the ticket is classified. A ticket requeued by `POST /tickets/reclassify` goes back to this pending shape, with `attempts` 0 and every label `null`, until it is classified again.
 
 ### Errors
 
@@ -175,7 +198,7 @@ Every error uses one envelope:
 | `ticket_conflict` | 409 | `POST /tickets` with an existing id and different content |
 | `ticket_not_found` | 404 | `GET /tickets/{id}` with an id that is not stored |
 | `invalid_cursor` | 400 | `GET /tickets` with a cursor the service did not produce |
-| `http_error` | 400 | `POST /tickets` with a body that cannot be decoded or parsed before validation |
+| `http_error` | 400 | `POST /tickets` or `POST /tickets/reclassify` with a body that cannot be decoded or parsed before validation |
 | `not_found` | 404 | A path that matches no route |
 | `method_not_allowed` | 405 | A method the matched route does not support |
 | `internal_error` | 500 | An unexpected server failure |
@@ -191,8 +214,8 @@ The `tickets` table is the queue. `WORKER_COUNT` asyncio tasks in the API proces
 A claim is a single `UPDATE … RETURNING` that picks the oldest claimable row (by `created_at`, then `id`), increments `attempts` and sets `claimed_at`. SQLite takes the write lock before the statement's subquery runs, so two workers never take the same row. A row is claimable when it is `pending`, has no live lease (`claimed_at` is `NULL` or older than `LEASE_TIMEOUT_S`) and has no future `next_attempt_at`. Every repository call runs in a thread, so SQLite never blocks the event loop. An idle worker sleeps `POLL_INTERVAL_S` between claims; a busy one claims again at once.
 
 ```text
-POST /tickets -> pending (attempts 0)
-                    |
+POST /tickets -> pending (attempts 0)  <---- POST /tickets/reclassify: failed, or classified with
+                    |                        an outdated prompt_version, reset to pending (attempts 0)
        claim: attempts + 1, claimed_at = now
                     v
            pending, claimed  <---- lease expired: claimable again
@@ -207,6 +230,8 @@ labels,          next_attempt_at = now + backoff
 prompt_version
 ```
 
+A requeue takes the write lock like a claim does, so a row is either reset or claimed, never half of each. A worker still holding a claim from before the reset finds its token gone, and its write is dropped as `stale` (below).
+
 Each attempt builds a fresh prompt, calls the model under `LLM_TIMEOUT_S` and hands the raw text to output validation. An accepted answer makes the ticket `classified` with its labels and `prompt_version`, and clears `last_error`. Anything else releases the claim with `last_error` set and `next_attempt_at = now + BACKOFF_BASE_S · 2^(attempts−1) + jitter` (jitter is up to one more `BACKOFF_BASE_S`), so with the defaults a ticket is retried after 1–2 s and then 2–3 s. Timeouts, unavailability, invalid output and unexpected errors follow the same policy, and `attempts` alone decides when a ticket is terminal: the last of `MAX_ATTEMPTS` attempts that is not accepted makes it `failed` with that attempt's code. Attempts are counted at claim time, so a ticket whose worker dies cannot loop forever: one claimed with more attempts than allowed is marked `failed` with `attempts_exhausted` without another model call.
 
 `last_error` holds one of these codes, never the model's text:
@@ -220,7 +245,7 @@ Each attempt builds a fresh prompt, calls the model under `LLM_TIMEOUT_S` and ha
 | `unexpected_error` | Any other exception during the attempt (a client bug, non-text output); logged with a sanitized traceback (see below) |
 | `attempts_exhausted` | The ticket was claimed with no attempts left (terminal, no model call) |
 
-Every finishing write is guarded by `WHERE id = ? AND status = 'pending' AND claimed_at = <the claim's timestamp>`, so a worker whose lease expired cannot overwrite the result of the worker that took over; its write matches no row and is logged as `stale`. `flagged` only ever goes up and the first `flag_reason` written is kept, on every outcome: the quote check's flag from a rejected attempt survives a later honest answer or a `failed` ending. Sample ticket t-1005 therefore ends `billing`/`low` with `flagged` true and reason `summary echoed quoted ticket text`, even though the accepted answer carried a reason of its own.
+Every finishing write is guarded by `WHERE id = ? AND status = 'pending' AND claimed_at = <the claim's timestamp>`, so a worker whose lease expired cannot overwrite the result of the worker that took over; its write matches no row and is logged as `stale`. `flagged` only ever goes up and the first `flag_reason` written is kept, on every outcome: the quote check's flag from a rejected attempt survives a later honest answer or a `failed` ending. Sample ticket t-1005 therefore ends `billing`/`low` with `flagged` true and reason `summary echoed quoted ticket text`, even though the accepted answer carried a reason of its own. A requeue by `POST /tickets/reclassify` is the one operation that lowers `flagged`: it is an operator's action, not the ticket author's, and the next attempt runs the model's flag and the quote check again, so a ticket that still carries the attack is flagged again.
 
 Each finished attempt logs one line with the worker, the ticket id, the attempt number, the outcome, the code, the prompt version, whether the body was truncated and the duration, for example `worker-0: t-1005 attempt 1/3 -> retry (summary_echoes_ticket) prompt=v1 truncated=false 0.004s`. Ticket text, prompts and model text are never logged. An unexpected exception, in an attempt or anywhere in the worker loop, is logged at ERROR as the type names and stack frames of the exception and of its chained causes, contexts and group members, with every exception message omitted (`ValueError (message omitted)`): a client or SDK error message can echo the prompt (the ticket) or the model's response, so it never reaches the log.
 
@@ -230,8 +255,8 @@ Known limits:
 
 - Shutdown is cancel-and-go: in-flight model calls are abandoned, with no grace period.
 - The claim sorts the pending rows (the index covers the `status` filter, not the order), so each claim costs O(pending). Fine for thousands of rows, not millions.
-- An idle pool picks up a new ticket within `POLL_INTERVAL_S`; ingest does not wake the workers. Each idle claim is a tiny write.
-- The claim token is the claim's microsecond timestamp. It is unique per claim because a ticket can only be claimed again after its lease expires or after a restart, and `LEASE_TIMEOUT_S` must exceed `LLM_TIMEOUT_S`.
+- An idle pool picks up a new or requeued ticket within `POLL_INTERVAL_S`; ingest and reclassify do not wake the workers. Each idle claim is a tiny write.
+- The claim token is the claim's microsecond timestamp. A ticket can only be claimed again after its lease expires, after a restart, or after a requeue by `POST /tickets/reclassify`. The token stays unique per claim because the clock moves between those events: `LEASE_TIMEOUT_S` must exceed `LLM_TIMEOUT_S`, and a requeue only resets a finished ticket, so the clock moves between the finish, the requeue and the next claim.
 - The startup claim reset assumes a single process: a second instance on the same database would wipe the first one's live claims at its start, so its results would be dropped as `stale` and the tickets classified again. Running two instances would need lease expiry only.
 - SQLite has one writer at a time: claims, results and ingest serialise, so throughput is bounded by statement latency, not by `WORKER_COUNT`.
 - A deterministic client bug costs `MAX_ATTEMPTS` model calls per ticket before it fails.

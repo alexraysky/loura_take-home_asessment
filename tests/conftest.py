@@ -1,5 +1,6 @@
 import dataclasses
 from collections.abc import Iterator
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 
 import pytest
@@ -68,3 +69,11 @@ def db(settings: Settings) -> Database:
 @pytest.fixture
 def repository(db: Database, clock: FakeClock) -> Repository:
     return Repository(db, clock)
+
+
+@pytest.fixture
+def worker_settings(settings: Settings) -> Settings:
+    # backoff 0: a retry is claimable at once, so the frozen FakeClock never needs to move.
+    return replace(
+        settings, worker_count=2, poll_interval_s=0.001, backoff_base_s=0.0, llm_timeout_s=1.0, lease_timeout_s=2.0
+    )
