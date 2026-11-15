@@ -410,10 +410,19 @@ _PAST_RE = _cues(
     r"(?:\w+ )?(?:days|weeks|months|years) ago",
     r"in 20\d\d",
 )
-# A recovered state ("is fine now", "working again") says the problem is over, so its "now" or
-# "again" is not ongoing wording.
-_RECOVERED = "fine|fixed|resolved|restored|recovered|working|up|online|ok|okay"
-_NOT_RECOVERED = "".join(rf"(?<!\b{word} )" for word in _RECOVERED.split("|"))
+# A recovered state ("is fine now", "working again now", "resolved today") says the problem is
+# over, so its "now", "again" or "today" is not ongoing wording. Each lookbehind is fixed-width.
+_RECOVERED = (
+    "fine|fixed|resolved|restored|recovered|work|works|working|running|operational|normal|good"
+    "|online|ok|okay|sorted|cleared"
+)
+# "up" is a recovery only after a state verb ("is up", "back up"), so the phrasal verbs in
+# "Following up again", "sign up today" and "set up now" are not.
+_UP_RECOVERED = ("is up", "are up", "'s up", "'re up", "was up", "were up", "back up")
+_NOT_RECOVERED = "".join(
+    rf"(?<!\b{p} )(?<!\b{p} again )" if p[0].isalnum() else rf"(?<!{p} )(?<!{p} again )"
+    for p in (*_RECOVERED.split("|"), *_UP_RECOVERED)
+)
 _ONGOING_RE = _cues(
     "still",
     f"{_NOT_RECOVERED}now",
@@ -421,26 +430,35 @@ _ONGOING_RE = _cues(
     f"{_NOT_RECOVERED}again",
     "ongoing",
     "since",
-    "(?<!earlier )today",
+    f"{_NOT_RECOVERED}(?<!earlier )today",
 )
 _RESOLVED_RE = _cues(
-    rf"(?:{_RECOVERED}) (?:now|again)",
-    r"(?:is|are|'s|'re|was|were|has been|have been|got) (?:fixed|resolved|restored|recovered)",
-    r"(?:is|are|'s|'re|came|come|comes) back (?:up|online)",
-    r"no longer (?:down|broken|failing|offline|unavailable|locked out|blocked|affected|impacted|an issue|a problem)",
+    rf"(?:{_RECOVERED}|(?:is|are|'s|'re|was|were|back) up) (?:again )?(?:now|again|today)",
+    r"(?:is|are|'s|'re|was|were|has been|have been|got) (?:all )?(?:fixed|resolved|restored|recovered|sorted"
+    r"|cleared(?: up)?)",
+    r"(?:resolved|fixed|sorted) itself",
+    r"(?:is|are|'s|'re|came|come|comes|went) back (?:up|online|to normal)",
+    r"back to normal",
+    r"no longer (?:down|broken|failing|crashing|offline|unavailable|locked out|blocked|degraded|slow"
+    r"|timing out|affected|impacted|an issue|a problem|happening|occurring)",
 )
 # A present-tense problem state is going on now, whatever past change caused it: "Our API is down
-# after last week's release.", "All users are locked out after last week's upgrade." The past
-# tense ("We had an outage", "Our API went down last month") stays historical.
+# after last week's release.", "All users are locked out after last week's upgrade.", "Login was
+# fixed this morning, but I am locked out.", "The outage was resolved, but the dashboard is slow."
+# The past tense ("We had an outage", "Our API went down last month") stays historical.
 _ACTIVE_STATE_RE = _cues(
-    r"(?:is|are|'s|'re|has been|have been) (?:still |currently |completely |totally )?"
+    r"(?:am|is|are|'m|'s|'re|has been|have been|'ve been) (?:still |currently |completely |totally )?"
     r"(?:down|broken|unavailable|failing|crashing|offline|locked out|blocked|degraded|compromised"
-    r"|returning|throwing|losing|unable|not working|affected|impacted)",
+    r"|returning|throwing|losing|unable|not working|affected|impacted|slow|timing out|lagging|hanging"
+    r"|freezing|stuck|unreachable|inaccessible)",
     "returns?",
     "throws?",
     "fails?",
     "crash(?:es)?",
     "freezes?",
+    "times? out",
+    "lags?",
+    "hangs?",
     "cannot",
     "can'?t",
     "doesn'?t work",
@@ -558,7 +576,8 @@ _DEADLINE_QUESTION_RE = _cues(
 )
 _REPEAT_RE = _cues(
     "still",
-    "again",
+    # "It is working again." confirms a recovery, not a repeat.
+    f"{_NOT_RECOVERED}again",
     "any update",
     "no (?:reply|response|answer)",
     "third time",
@@ -580,6 +599,28 @@ _FOLLOW_UP_RE = _cues(
     "haven'?t heard",
     "asked (?:twice|again|before|already)",
     "still (?:no|not|waiting|missing|unresolved|broken|failing|unable|can'?t|cannot|have(?:n'?t| not| no))",
+)
+# Wording about an earlier contact with support. It keeps a dated repeat cue a follow-up when the
+# sentence is otherwise past: "I asked about my invoice two days ago." waits for an answer, "Our API
+# went down two days ago." only dates an incident.
+_CONTACT_RE = _cues(
+    "wrote",
+    "written",
+    "asked",
+    "emailed",
+    "messaged",
+    "contacted",
+    "submitted",
+    "opened",
+    "filed",
+    "requested",
+    "reached out",
+    "follow(?:ing)? ?up",
+    "any update",
+    "no (?:reply|response|answer)",
+    "haven'?t heard",
+    "third time",
+    "second time",
 )
 _HOWTO_RE = _cues(
     "how (?:do|can|should|would) (?:i|we)",
@@ -866,7 +907,7 @@ def classify_text(subject: str, body: str) -> dict[str, Any]:
     # Bare repeat wording ("still", "again") raises a ticket unless it only modifies a how-to
     # question ("How can I see my invoice again?"); a reported follow-up raises it even then.
     # "What if my export fails again?" only imagines a repeat.
-    repeated = followed_up or any(_states(_REPEAT_RE, s, reported=True) for s in sentences)
+    repeated = followed_up or any(map(_reports_repeat, sentences))
     impaired = blocked or degraded
     if high:
         priority = "high"
@@ -984,18 +1025,50 @@ def _is_past_or_resolved(sentence: str) -> bool:
     # "We had a production outage last year; how do I get the SLA report?", "Our site was down
     # yesterday but is fine now." and "Fixed now - our dashboard is back up." mention a past or
     # resolved problem; wording that says it is still going on, or a present-tense problem state
-    # ("Our API is down after last week's release."), keeps it a report.
+    # ("Our API is down after last week's release."), keeps it a report. That wording counts only
+    # when stated, so "We had an outage yesterday; what if it happens again?" stays past.
     reported = _reported_part(sentence)
     return (
         bool(_PAST_RE.search(reported) or _RESOLVED_RE.search(reported))
-        and not _ONGOING_RE.search(reported)
-        and not _ACTIVE_STATE_RE.search(reported)
+        and not _states(_ONGOING_RE, sentence, reported=True)
+        and not _states(_ACTIVE_STATE_RE, sentence, reported=True)
     )
+
+
+def _active_sentence(sentence: str) -> str:
+    """The sentence without its clauses that only tell of a past or resolved problem."""
+    # "The outage was resolved this morning, but the dashboard is slow." still reports the slow
+    # dashboard, not the outage. A clause that says the problem goes on ("Our API went down
+    # yesterday and is still down.") or imagines it ("what if it happens again?") is kept.
+    if _is_past_or_resolved(sentence):
+        return ""
+    if not (_PAST_RE.search(sentence) or _RESOLVED_RE.search(sentence)):
+        return sentence
+    ongoing = _states(_ONGOING_RE, sentence, reported=True)
+    cues = _HYPOTHETICAL_RE if _is_question(sentence) else _PREVENTIVE_RE
+    clauses = [clause.strip() for clause in _CLAUSE_SPLIT_RE.split(sentence)]
+    kept = [
+        clause
+        for clause in clauses
+        if cues.search(clause)
+        or _ONGOING_RE.search(clause)
+        or _ACTIVE_STATE_RE.search(clause)
+        or not (_RESOLVED_RE.search(clause) or (not ongoing and _PAST_RE.search(clause)))
+    ]
+    if not kept:
+        return ""
+    if len(kept) == len(clauses):
+        return sentence
+    active = ", ".join(clause for clause in kept if clause)
+    if _is_question(sentence) and not active.endswith("?"):
+        active += "?"
+    return active
 
 
 def _reports_high_impact(sentence: str) -> bool:
     """Whether the sentence reports impact that makes a ticket high on its own."""
-    if _is_past_or_resolved(sentence):
+    sentence = _active_sentence(sentence)
+    if not sentence:
         return False
     return (
         _reports_incident(sentence)
@@ -1008,7 +1081,10 @@ def _reports_high_impact(sentence: str) -> bool:
 def _reports_blocker(sentence: str) -> bool:
     # "I am locked out." reports a blocker, "What happens if all users are locked out?" asks about one.
     # "How do I handle errors in the API?" asks about errors; only wording before a how-to counts.
-    return not _is_past_or_resolved(sentence) and _states(_BLOCKED_RE, sentence, reported=True)
+    sentence = _active_sentence(sentence)
+    if not sentence:
+        return False
+    return _states(_BLOCKED_RE, sentence, reported=True)
 
 
 def _is_production_failure(sentence: str) -> bool:
@@ -1178,7 +1254,10 @@ def _states(
 
 
 def _reports_degradation(sentence: str) -> bool:
-    return not _is_past_or_resolved(sentence) and _states(_DEGRADED_RE, sentence, reported=True)
+    sentence = _active_sentence(sentence)
+    if not sentence:
+        return False
+    return _states(_DEGRADED_RE, sentence, reported=True)
 
 
 def _reports_money_owed(sentence: str) -> bool:
@@ -1195,8 +1274,24 @@ def _reports_deadline(sentence: str) -> bool:
 
 def _reports_follow_up(sentence: str) -> bool:
     # "I have asked twice and still have no response." is a follow-up, "How do I follow up on a
-    # refund?" is a how-to question.
+    # refund?" is a how-to question. A follow-up that confirms a recovery ("Following up: the
+    # export is fixed now.") leaves nothing open, unlike "Our API went down yesterday; any update?".
+    if _is_past_or_resolved(sentence) and _RESOLVED_RE.search(_reported_part(sentence)):
+        return False
     return _states(_FOLLOW_UP_RE, sentence, reported=True)
+
+
+def _reports_repeat(sentence: str) -> bool:
+    # "Our API went down two days ago." and "The export is fixed now and working again." tell of
+    # a problem that is over, so their repeat cues are only dates or a recovery. A dated earlier
+    # contact still waits for an answer: "I asked about my invoice two days ago."
+    if _is_past_or_resolved(sentence):
+        return (
+            not _RESOLVED_RE.search(_reported_part(sentence))
+            and _states(_CONTACT_RE, sentence, reported=True)
+            and _states(_REPEAT_RE, sentence, reported=True)
+        )
+    return _states(_REPEAT_RE, sentence, reported=True)
 
 
 def _reports_impact(sentence: str) -> bool:

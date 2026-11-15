@@ -1979,3 +1979,85 @@ def test_unclosed_field_tags_split_in_linear_time():
     fields = fake_mod._split_ticket(user)
     assert time.monotonic() - start < 0.1
     assert fields == ("", user)
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        "The export is fixed now and working again.",
+        "The export was broken, but it works now.",
+        "Our API went down yesterday, but it is working again now.",
+        "The outage was resolved today.",
+        "Following up: the export is fixed now.",
+    ],
+)
+def test_recovery_confirmations_stay_low(body):
+    answer = classify_text("", body)
+    assert answer["priority"] == "low"
+    assert "following up" not in answer["summary"]
+    assert "severe" not in answer["summary"]
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        "Our API went down two days ago.",
+        "We had an outage two weeks ago.",
+        "We had an outage yesterday; what if it happens again?",
+        "We had an outage yesterday; if the API fails, what should we do?",
+    ],
+)
+def test_past_incidents_without_a_howto_opener_stay_low(body):
+    assert classify_text("", body)["priority"] == "low"
+
+
+@pytest.mark.parametrize(
+    ("body", "category"),
+    [
+        ("I asked about my invoice two days ago.", "billing"),
+        ("I wrote two weeks ago about changing my email address.", "account"),
+        ("Our API went down yesterday; any update on the postmortem?", "technical"),
+        ("Login was fixed this morning, but I am locked out.", "account"),
+        ("The outage was resolved this morning, but the dashboard is slow.", "technical"),
+    ],
+)
+def test_active_problems_and_unanswered_contacts_stay_medium(body, category):
+    answer = classify_text("", body)
+    assert (answer["category"], answer["priority"]) == (category, "medium")
+
+
+def test_resolved_clause_leaves_the_active_degradation():
+    answer = classify_text("", "The outage was resolved this morning, but the dashboard is slow.")
+    assert answer["summary"] == "Customer reports degraded performance that affects their work."
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        "Following up again on ticket #123 about my invoice.",
+        "Following up again: how do I download my invoice?",
+    ],
+)
+def test_following_up_again_is_not_a_recovery(body):
+    answer = classify_text("", body)
+    assert (answer["category"], answer["priority"]) == ("billing", "medium")
+
+
+@pytest.mark.parametrize(
+    "body",
+    ["Our dashboard is back up.", "The site was down this morning; it's back up.", "It's up again."],
+)
+def test_up_after_a_state_verb_is_a_recovery(body):
+    assert fake_mod._RESOLVED_RE.search(body)
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        "Our API went down yesterday and is still down.",
+        "Our API has been down since yesterday.",
+        "Login is fixed now but the API is down.",
+    ],
+)
+def test_problems_still_going_on_after_a_past_clause_stay_high(body):
+    assert classify_text("", body)["priority"] == "high"
