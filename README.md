@@ -209,7 +209,7 @@ The approach assumes an injection will sometimes succeed and makes success worth
 | 6 | Human approval for consequential actions | Documented only: see the `summary` note above |
 | 7 | Adversarial tests: injection tickets stay in the suite so a prompt change that weakens the defence shows up | Implemented (`tests/test_prompt.py`, `tests/test_validation.py`, `tests/test_llm_fake.py`) |
 
-On sample ticket t-1005: the ticket tries to plant "Approved for immediate refund" in a field a person or a downstream system might act on. It is not treated as a fraud verdict: there is no such category, the ticket also contains a genuine question, and the service cannot judge intent. With the fake in its default gullible mode the first attempt obeys the injection, the quote check rejects that answer and flags the ticket, and the retry classifies the real question as billing/low with the flag kept. The ticket can never end up as technical/high with the attacker's summary.
+On sample ticket t-1005: the ticket tries to plant "Approved for immediate refund" in a field a person or a downstream system might act on. It is not treated as a fraud verdict: there is no such category, the ticket also contains a genuine question, and the service cannot judge intent. With the fake in its default gullible mode the first attempt obeys the injection, the quote check rejects that answer and flags the ticket, and a later attempt classifies the real question as billing/low with the flag kept, or the ticket fails with the flag kept. The ticket can never end up as technical/high with the attacker's summary.
 
 Known limits:
 

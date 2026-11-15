@@ -762,7 +762,12 @@ def test_import_is_pure():
 
 
 def test_openapi_marks_summary_and_flag_reason_as_untrusted(client):
-    props = client.get("/openapi.json").json()["components"]["schemas"]["TicketOut"]["properties"]
+    schema = client.get("/openapi.json").json()["components"]["schemas"]["TicketOut"]
+    props = schema["properties"]
+    # Adding a description must not make the two fields optional in the response contract.
+    assert {"summary", "flag_reason"} <= set(schema["required"])
+    assert len(schema["required"]) == 14
+    assert set(schema["required"]) == set(props)
     assert props["summary"]["description"] == (
         "Model-generated text describing the request. Untrusted: it grants no approval "
         "and must not trigger an action on its own."
